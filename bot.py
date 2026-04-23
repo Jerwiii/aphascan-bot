@@ -30,9 +30,6 @@ daily_top         = []
 watchlist_wallets = {}   # address -> label
 dev_cache         = {}   # deployer -> risk dict
 smart_wallet_db   = {}   # address -> {wins, total, win_rate}
-blacklisted_devs  = set() # deployer addresses that have rugged before
-copy_signal_cache = {}    # mint -> {wallets: [], first_seen: datetime}
-price_cache       = {}    # mint -> {mcap, price, volume, fetched_at}
 
 # ── Launchpads ─────────────────────────────────────────────────────────────────
 LAUNCHPADS = {
@@ -46,81 +43,6 @@ LAUNCHPADS = {
 # ── Proven smart money seeds (expandable via /addwallet command) ───────────────
 # These are wallets known to enter early on winners. Add real ones you discover.
 SMART_MONEY_SEEDS = set(os.environ.get("SMART_WALLETS", "").split(",")) - {""}
-
-
-# ── DexScreener price & market cap fetcher ────────────────────────────────────
-async def fetch_price_data(session, mint: str) -> dict:
-    """
-    Fetch real-time price, market cap, volume and liquidity from DexScreener.
-    Free API, no key needed. Returns clean dict ready for alerts.
-    """
-    result = {
-        "price_usd":   None,
-        "mcap":        None,
-        "volume_24h":  None,
-        "liquidity":   None,
-        "price_change_5m":  None,
-        "price_change_1h":  None,
-        "price_change_24h": None,
-        "dex":         None,
-        "found":       False,
-    }
-    # Check cache — DexScreener rate-limits, don't hammer it
-    cached = price_cache.get(mint)
-    if cached:
-        age = (datetime.now(timezone.utc) - cached["fetched_at"]).total_seconds()
-        if age < 60:
-            return cached
-
-    try:
-        url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
-            if r.status != 200:
-                return result
-            data = await r.json()
-            pairs = data.get("pairs") or []
-            if not pairs:
-                return result
-            # Pick the pair with highest liquidity
-            pairs.sort(key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0), reverse=True)
-            p = pairs[0]
-            result.update({
-                "price_usd":        p.get("priceUsd"),
-                "mcap":             p.get("marketCap"),
-                "volume_24h":       p.get("volume", {}).get("h24"),
-                "liquidity":        p.get("liquidity", {}).get("usd"),
-                "price_change_5m":  p.get("priceChange", {}).get("m5"),
-                "price_change_1h":  p.get("priceChange", {}).get("h1"),
-                "price_change_24h": p.get("priceChange", {}).get("h24"),
-                "dex":              p.get("dexId"),
-                "found":            True,
-            })
-            result["fetched_at"] = datetime.now(timezone.utc)
-            price_cache[mint] = result
-    except Exception as e:
-        log.debug(f"DexScreener {mint[:8]}: {e}")
-    return result
-
-
-def fmt_usd(val) -> str:
-    """Format a dollar value cleanly."""
-    try:
-        v = float(val)
-        if v >= 1_000_000: return f"${v/1_000_000:.2f}M"
-        if v >= 1_000:     return f"${v/1_000:.1f}K"
-        return f"${v:.4f}"
-    except Exception:
-        return "N/A"
-
-
-def fmt_pct(val) -> str:
-    """Format a percentage change with color emoji."""
-    try:
-        v = float(val)
-        arrow = "📈" if v >= 0 else "📉"
-        return f"{arrow} {v:+.1f}%"
-    except Exception:
-        return "N/A"
 
 # ── RPC helper ─────────────────────────────────────────────────────────────────
 async def rpc(session, method, params, req_id=1):
@@ -256,7 +178,6 @@ async def check_dev_history(session, deployer: str) -> dict:
         if launches > 50:
             result["is_serial"] = True
             result["risk"]      = "high"
-            blacklisted_devs.add(deployer)  # auto-blacklist serial ruggers
         elif launches > 20:
             result["risk"]      = "medium"
         dev_cache[deployer] = result
@@ -265,7 +186,7 @@ async def check_dev_history(session, deployer: str) -> dict:
     return result
 
 # ── Signal 5: Smart money detection ───────────────────────────────────────────
-async def count_smart_buyers(session, sigs: list, mint: str = "") -> dict:
+async def count_smart_buyers(session, sigs: list) -> dict:
     """
     Check how many known high-win-rate wallets bought this token early.
     Even 1 smart wallet = meaningful signal. 3+ = very strong buy signal.
@@ -299,14 +220,6 @@ async def count_smart_buyers(session, sigs: list, mint: str = "") -> dict:
             continue
     c = result["count"]
     result["score"] = 25 if c >= 3 else 18 if c == 2 else 10 if c == 1 else 0
-
-    # Track copy signal — if 3+ smart wallets buy same token, fire special alert
-    if c >= 2:
-        if mint not in copy_signal_cache:
-            copy_signal_cache[mint] = {"wallets": result["wallets"], "first_seen": datetime.now(timezone.utc), "alerted": False}
-        else:
-            copy_signal_cache[mint]["wallets"] = list(set(copy_signal_cache[mint]["wallets"] + result["wallets"]))
-
     return result
 
 # ── Signal 6: Holder distribution ─────────────────────────────────────────────
@@ -413,7 +326,7 @@ async def enrich_token(session, mint: str, launchpad: tuple) -> dict | None:
             check_authorities(session, mint),
             check_liquidity(session, mint),
             check_holders(session, mint),
-            count_smart_buyers(session, sigs, mint),
+            count_smart_buyers(session, sigs),
             check_dev_history(session, deployer),
             check_price_momentum(session, mint, sigs),
             check_graduation(session, mint),
@@ -421,11 +334,9 @@ async def enrich_token(session, mint: str, launchpad: tuple) -> dict | None:
 
         bundle = detect_bundling(sigs[:30])
         vel    = score_velocity(sigs)
-        price  = await fetch_price_data(session, mint)
 
         return {
             "mint":       mint,
-            "price":      price,
             "launchpad":  launchpad,
             "deployer":   deployer,
             "auth":       auth,
@@ -528,8 +439,6 @@ def score_token(info: dict) -> dict:
         hard_fail = True; fail_reasons.append("serial rugger + <30 holders")
     if not auth["mint_revoked"] and not auth["freeze_revoked"] and h["top1_pct"] > 30:
         hard_fail = True; fail_reasons.append("active authorities + concentrated supply")
-    if info.get("deployer","") in blacklisted_devs:
-        hard_fail = True; fail_reasons.append("deployer is blacklisted rugger")
 
     if hard_fail:
         warnings.append(f"❌ HARD FAIL: {', '.join(fail_reasons)}")
@@ -557,44 +466,6 @@ def detect_launchpad(keys: list) -> tuple:
         if k in LAUNCHPADS:
             return LAUNCHPADS[k]
     return ("Unknown", "⚪")
-
-
-# ── Multi-wallet copy signal ───────────────────────────────────────────────────
-async def check_copy_signals(bot: Bot):
-    """
-    Fire a special HIGH CONVICTION alert when 3+ smart wallets
-    independently bought the same token within a short window.
-    """
-    now = datetime.now(timezone.utc)
-    for mint, data in list(copy_signal_cache.items()):
-        if data.get("alerted"):
-            continue
-        wallets = data.get("wallets", [])
-        if len(wallets) < 3:
-            continue
-        # Only alert within 30 minutes of first detection
-        age_mins = (now - data["first_seen"]).total_seconds() / 60
-        if age_mins > 30:
-            copy_signal_cache[mint]["alerted"] = True
-            continue
-        copy_signal_cache[mint]["alerted"] = True
-        short_wallets = [f"`{w[:6]}...{w[-4:]}`" for w in wallets[:5]]
-        await bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID,
-            text=(
-                f"🔥 *COPY SIGNAL — HIGH CONVICTION*\n\n"
-                f"*{len(wallets)} smart wallets* bought the same token\n"
-                f"`{mint}`\n\n"
-                f"*Wallets:*\n" + "\n".join(short_wallets) + "\n\n"
-                f"*Time since first buy:* {age_mins:.1f} min\n\n"
-                f"This is a rare signal. Do your own checks first.\n\n"
-                f"🔗 [DexScreener](https://dexscreener.com/solana/{mint}) | "
-                f"[Birdeye](https://birdeye.so/token/{mint}?chain=solana)"
-            ),
-            parse_mode="Markdown",
-            disable_web_page_preview=True
-        )
-        log.info(f"Copy signal fired for {mint[:8]} — {len(wallets)} wallets")
 
 # ── Fetch new token mints ──────────────────────────────────────────────────────
 async def fetch_new_tokens(session) -> list:
@@ -712,29 +583,15 @@ def format_alert(mint: str, info: dict, result: dict) -> str:
     liq       = info.get("liquidity", {})
     mom       = info.get("momentum", {})
     h         = info.get("holders", {})
-    px        = info.get("price", {})
 
     boosts_txt   = "\n".join(result["boosts"])   or "—"
     warnings_txt = "\n".join(result["warnings"]) or "—"
-
-    price_block = ""
-    if px and px.get("found"):
-        price_block = (
-            f"*Price:* {fmt_usd(px.get('price_usd'))}  "
-            f"MCap: {fmt_usd(px.get('mcap'))}\n"
-            f"*Volume 24h:* {fmt_usd(px.get('volume_24h'))}  "
-            f"Liq: {fmt_usd(px.get('liquidity'))}\n"
-            f"*Change:* 5m {fmt_pct(px.get('price_change_5m'))}  "
-            f"1h {fmt_pct(px.get('price_change_1h'))}  "
-            f"24h {fmt_pct(px.get('price_change_24h'))}\n\n"
-        )
 
     return (
         f"🚨 *AlphaScan Alert*\n\n"
         f"*Launchpad:* {lp_emoji} {lp_name}\n"
         f"*Token:* `{mint}`\n"
-        f"*Score:* {score}/99  `{bar}`\n"
-        f"{price_block}"
+        f"*Score:* {score}/99  `{bar}`\n\n"
         f"*Breakdown:*\n"
         f"  🐋 Smart money:   {bd.get('smart_money',0)}/25\n"
         f"  📊 Distribution:  {bd.get('distribution',0)}/20\n"
@@ -775,8 +632,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/summary — today's top tokens\n"
         "/status — bot health & settings\n"
         "/analyze `<CA>` — analyze any token on demand\n"
-        "Or just *paste any CA* directly into chat\n"
-        "/blacklist — view/add blacklisted deployers\n",
+        "Or just *paste any CA* directly into chat\n",
         parse_mode="Markdown"
     )
 
@@ -830,25 +686,6 @@ async def cmd_addwallet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-
-async def cmd_blacklist(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Show or manually add to the auto-blacklist."""
-    if ctx.args:
-        addr = ctx.args[0]
-        blacklisted_devs.add(addr)
-        await update.message.reply_text(
-            f"🚫 Added to blacklist\n`{addr[:8]}...{addr[-4:]}`",
-            parse_mode="Markdown"
-        )
-    else:
-        if not blacklisted_devs:
-            await update.message.reply_text("Blacklist is empty — auto-populated as rugs are detected.")
-            return
-        lines = ["🚫 *Blacklisted deployers:*\n"]
-        for addr in list(blacklisted_devs)[:20]:
-            lines.append(f"• `{addr[:8]}...{addr[-4:]}`")
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
 async def cmd_summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await send_daily_summary(ctx.bot)
 
@@ -867,7 +704,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"✅ Dev rug history\n✅ Liquidity depth\n"
         f"✅ Price momentum\n✅ Smart money\n"
         f"✅ Holder distribution\n✅ TX velocity\n"
-        f"✅ Graduation tracking\n✅ DexScreener price data\n✅ Auto-blacklist ruggers\n✅ Multi-wallet copy signal\n",
+        f"✅ Graduation tracking\n",
         parse_mode="Markdown"
     )
 
@@ -910,7 +747,6 @@ async def scan_loop(bot: Bot):
                         await asyncio.sleep(1.5)
 
                 await scan_watchlist(session, bot)
-                await check_copy_signals(bot)
                 if scan_count % 10 == 0:
                     await check_performance(bot, session)
 
@@ -1006,25 +842,11 @@ async def run_analysis(update: Update, mint: str):
             boosts_txt   = "\n".join(result["boosts"])   or "None"
             warnings_txt = "\n".join(result["warnings"]) or "None"
 
-            px = info.get("price", {})
-            price_block = ""
-            if px and px.get("found"):
-                price_block = (
-                    f"*Price:* {fmt_usd(px.get('price_usd'))}  "
-                    f"MCap: {fmt_usd(px.get('mcap'))}\n"
-                    f"*Volume 24h:* {fmt_usd(px.get('volume_24h'))}  "
-                    f"Liq: {fmt_usd(px.get('liquidity'))}\n"
-                    f"*Change:* 5m {fmt_pct(px.get('price_change_5m'))}  "
-                    f"1h {fmt_pct(px.get('price_change_1h'))}  "
-                    f"24h {fmt_pct(px.get('price_change_24h'))}\n\n"
-                )
-
             report = (
                 f"🔬 *Token Analysis Report*\n\n"
                 f"*CA:* `{mint}`\n"
                 f"*Launchpad:* {lp_emoji} {lp_name}\n"
                 f"*Score:* {score}/99  `{bar}`\n"
-                f"{price_block}"
                 f"*Verdict:* {verdict}\n\n"
                 f"*Score breakdown:*\n"
                 f"  🐋 Smart money:   {bd.get('smart_money',0)}/25\n"
@@ -1077,7 +899,6 @@ def main():
         ("summary",   cmd_summary),
         ("status",    cmd_status),
         ("analyze",   cmd_analyze),
-        ("blacklist",  cmd_blacklist),
     ]:
         app.add_handler(CommandHandler(cmd, handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
