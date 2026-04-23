@@ -233,12 +233,11 @@ async def scan_loop():
     await bot.send_message(
         chat_id=TELEGRAM_CHAT_ID,
         text=(
-            f"✅ *AlphaScan.sol is live\\!*\n\n"
-            f"Scanning Solana every {SCAN_INTERVAL // 60} minutes\\.\n"
-            f"Alerts fire when alpha score \\> {ALPHA_THRESHOLD}\\.\n\n"
-            f"_Waiting for first scan\\.\\.\\._"
-        ),
-        parse_mode=ParseMode.MARKDOWN_V2
+            f"✅ AlphaScan.sol is live!\n\n"
+            f"Scanning Solana every {SCAN_INTERVAL // 60} minutes.\n"
+            f"Alerts fire when alpha score > {ALPHA_THRESHOLD}.\n\n"
+            f"Waiting for first scan..."
+        )
     )
 
     async with aiohttp.ClientSession() as session:
