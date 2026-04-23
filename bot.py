@@ -30,6 +30,9 @@ daily_top         = []
 watchlist_wallets = {}   # address -> label
 dev_cache         = {}   # deployer -> risk dict
 smart_wallet_db   = {}   # address -> {wins, total, win_rate}
+blacklisted_devs  = set() # deployer addresses that have rugged before
+copy_signal_cache = {}    # mint -> {wallets: [], first_seen: datetime}
+price_cache       = {}    # mint -> {mcap, price, volume, fetched_at}
 
 # ── Launchpads ─────────────────────────────────────────────────────────────────
 LAUNCHPADS = {
@@ -43,6 +46,81 @@ LAUNCHPADS = {
 # ── Proven smart money seeds (expandable via /addwallet command) ───────────────
 # These are wallets known to enter early on winners. Add real ones you discover.
 SMART_MONEY_SEEDS = set(os.environ.get("SMART_WALLETS", "").split(",")) - {""}
+
+
+# ── DexScreener price & market cap fetcher ────────────────────────────────────
+async def fetch_price_data(session, mint: str) -> dict:
+    """
+    Fetch real-time price, market cap, volume and liquidity from DexScreener.
+    Free API, no key needed. Returns clean dict ready for alerts.
+    """
+    result = {
+        "price_usd":   None,
+        "mcap":        None,
+        "volume_24h":  None,
+        "liquidity":   None,
+        "price_change_5m":  None,
+        "price_change_1h":  None,
+        "price_change_24h": None,
+        "dex":         None,
+        "found":       False,
+    }
+    # Check cache — DexScreener rate-limits, don't hammer it
+    cached = price_cache.get(mint)
+    if cached:
+        age = (datetime.now(timezone.utc) - cached["fetched_at"]).total_seconds()
+        if age < 60:
+            return cached
+
+    try:
+        url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status != 200:
+                return result
+            data = await r.json()
+            pairs = data.get("pairs") or []
+            if not pairs:
+                return result
+            # Pick the pair with highest liquidity
+            pairs.sort(key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0), reverse=True)
+            p = pairs[0]
+            result.update({
+                "price_usd":        p.get("priceUsd"),
+                "mcap":             p.get("marketCap"),
+                "volume_24h":       p.get("volume", {}).get("h24"),
+                "liquidity":        p.get("liquidity", {}).get("usd"),
+                "price_change_5m":  p.get("priceChange", {}).get("m5"),
+                "price_change_1h":  p.get("priceChange", {}).get("h1"),
+                "price_change_24h": p.get("priceChange", {}).get("h24"),
+                "dex":              p.get("dexId"),
+                "found":            True,
+            })
+            result["fetched_at"] = datetime.now(timezone.utc)
+            price_cache[mint] = result
+    except Exception as e:
+        log.debug(f"DexScreener {mint[:8]}: {e}")
+    return result
+
+
+def fmt_usd(val) -> str:
+    """Format a dollar value cleanly."""
+    try:
+        v = float(val)
+        if v >= 1_000_000: return f"${v/1_000_000:.2f}M"
+        if v >= 1_000:     return f"${v/1_000:.1f}K"
+        return f"${v:.4f}"
+    except Exception:
+        return "N/A"
+
+
+def fmt_pct(val) -> str:
+    """Format a percentage change with color emoji."""
+    try:
+        v = float(val)
+        arrow = "📈" if v >= 0 else "📉"
+        return f"{arrow} {v:+.1f}%"
+    except Exception:
+        return "N/A"
 
 # ── RPC helper ─────────────────────────────────────────────────────────────────
 async def rpc(session, method, params, req_id=1):
@@ -178,6 +256,7 @@ async def check_dev_history(session, deployer: str) -> dict:
         if launches > 50:
             result["is_serial"] = True
             result["risk"]      = "high"
+            blacklisted_devs.add(deployer)  # auto-blacklist serial ruggers
         elif launches > 20:
             result["risk"]      = "medium"
         dev_cache[deployer] = result
@@ -186,7 +265,7 @@ async def check_dev_history(session, deployer: str) -> dict:
     return result
 
 # ── Signal 5: Smart money detection ───────────────────────────────────────────
-async def count_smart_buyers(session, sigs: list) -> dict:
+async def count_smart_buyers(session, sigs: list, mint: str = "") -> dict:
     """
     Check how many known high-win-rate wallets bought this token early.
     Even 1 smart wallet = meaningful signal. 3+ = very strong buy signal.
@@ -220,6 +299,14 @@ async def count_smart_buyers(session, sigs: list) -> dict:
             continue
     c = result["count"]
     result["score"] = 25 if c >= 3 else 18 if c == 2 else 10 if c == 1 else 0
+
+    # Track copy signal — if 3+ smart wallets buy same token, fire special alert
+    if c >= 2:
+        if mint not in copy_signal_cache:
+            copy_signal_cache[mint] = {"wallets": result["wallets"], "first_seen": datetime.now(timezone.utc), "alerted": False}
+        else:
+            copy_signal_cache[mint]["wallets"] = list(set(copy_signal_cache[mint]["wallets"] + result["wallets"]))
+
     return result
 
 # ── Signal 6: Holder distribution ─────────────────────────────────────────────
@@ -326,7 +413,7 @@ async def enrich_token(session, mint: str, launchpad: tuple) -> dict | None:
             check_authorities(session, mint),
             check_liquidity(session, mint),
             check_holders(session, mint),
-            count_smart_buyers(session, sigs),
+            count_smart_buyers(session, sigs, mint),
             check_dev_history(session, deployer),
             check_price_momentum(session, mint, sigs),
             check_graduation(session, mint),
@@ -334,9 +421,11 @@ async def enrich_token(session, mint: str, launchpad: tuple) -> dict | None:
 
         bundle = detect_bundling(sigs[:30])
         vel    = score_velocity(sigs)
+        price  = await fetch_price_data(session, mint)
 
         return {
             "mint":       mint,
+            "price":      price,
             "launchpad":  launchpad,
             "deployer":   deployer,
             "auth":       auth,
@@ -439,6 +528,8 @@ def score_token(info: dict) -> dict:
         hard_fail = True; fail_reasons.append("serial rugger + <30 holders")
     if not auth["mint_revoked"] and not auth["freeze_revoked"] and h["top1_pct"] > 30:
         hard_fail = True; fail_reasons.append("active authorities + concentrated supply")
+    if info.get("deployer","") in blacklisted_devs:
+        hard_fail = True; fail_reasons.append("deployer is blacklisted rugger")
 
     if hard_fail:
         warnings.append(f"❌ HARD FAIL: {', '.join(fail_reasons)}")
@@ -467,14 +558,110 @@ def detect_launchpad(keys: list) -> tuple:
             return LAUNCHPADS[k]
     return ("Unknown", "⚪")
 
+
+# ── Multi-wallet copy signal ───────────────────────────────────────────────────
+async def check_copy_signals(bot: Bot):
+    """
+    Fire a special HIGH CONVICTION alert when 3+ smart wallets
+    independently bought the same token within a short window.
+    """
+    now = datetime.now(timezone.utc)
+    for mint, data in list(copy_signal_cache.items()):
+        if data.get("alerted"):
+            continue
+        wallets = data.get("wallets", [])
+        if len(wallets) < 3:
+            continue
+        # Only alert within 30 minutes of first detection
+        age_mins = (now - data["first_seen"]).total_seconds() / 60
+        if age_mins > 30:
+            copy_signal_cache[mint]["alerted"] = True
+            continue
+        copy_signal_cache[mint]["alerted"] = True
+        short_wallets = [f"`{w[:6]}...{w[-4:]}`" for w in wallets[:5]]
+        await bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text=(
+                f"🔥 *COPY SIGNAL — HIGH CONVICTION*\n\n"
+                f"*{len(wallets)} smart wallets* bought the same token\n"
+                f"`{mint}`\n\n"
+                f"*Wallets:*\n" + "\n".join(short_wallets) + "\n\n"
+                f"*Time since first buy:* {age_mins:.1f} min\n\n"
+                f"This is a rare signal. Do your own checks first.\n\n"
+                f"🔗 [DexScreener](https://dexscreener.com/solana/{mint}) | "
+                f"[Birdeye](https://birdeye.so/token/{mint}?chain=solana)"
+            ),
+            parse_mode="Markdown",
+            disable_web_page_preview=True
+        )
+        log.info(f"Copy signal fired for {mint[:8]} — {len(wallets)} wallets")
+
 # ── Fetch new token mints ──────────────────────────────────────────────────────
-async def fetch_new_tokens(session) -> list:
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DUAL SCANNER ENGINE
+# Scanner 1: Real-time launch detection  — catches tokens seconds after mint
+# Scanner 2: Momentum scanner            — catches any-age tokens gaining steam
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Pump.fun program address (the real one) ────────────────────────────────────
+PUMPFUN_PROGRAM  = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+LETSBONK_PROGRAM = "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj"
+RAYDIUM_PROGRAM  = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"  # Raydium AMM v4
+
+# Momentum tracker — persists across scans
+momentum_tracker = {}  # mint -> {vol_samples: [], buyer_samples: [], first_seen, launchpad}
+trending_tracker  = {}  # mint -> {snapshots: [], first_seen, alerted}
+
+# ── SCANNER 1: Real-time Pump.fun launch detection ────────────────────────────
+async def scanner1_new_launches(session) -> list:
+    """
+    Watch Pump.fun and LetsBonk program accounts directly.
+    Catches tokens within 1-2 scan cycles of launch.
+    Much faster than watching the generic Token Program.
+    """
     mints = []
+    programs = [
+        (PUMPFUN_PROGRAM,  ("Pump.fun",     "🟢")),
+        (LETSBONK_PROGRAM, ("LetsBonk.fun", "🟡")),
+    ]
+    for program_addr, launchpad in programs:
+        try:
+            sigs = await rpc(session, "getSignaturesForAddress", [
+                program_addr, {"limit": 40}
+            ])
+            for s in (sigs or [])[:20]:
+                try:
+                    tx = await rpc(session, "getTransaction", [
+                        s["signature"],
+                        {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}
+                    ])
+                    if not tx:
+                        continue
+                    msg  = tx.get("transaction", {}).get("message", {})
+                    keys = [
+                        a.get("pubkey","") if isinstance(a,dict) else str(a)
+                        for a in msg.get("accountKeys", [])
+                    ]
+                    for ix in msg.get("instructions", []) + [
+                        inner
+                        for group in (tx.get("meta", {}).get("innerInstructions") or [])
+                        for inner in group.get("instructions", [])
+                    ]:
+                        p = ix.get("parsed", {})
+                        if isinstance(p, dict) and p.get("type") == "initializeMint":
+                            mint = p.get("info", {}).get("mint")
+                            if mint and mint not in seen_mints:
+                                mints.append((mint, launchpad, "launch"))
+                except Exception:
+                    continue
+        except Exception as e:
+            log.debug(f"Scanner1 {program_addr[:8]}: {e}")
+
+    # Also check Raydium for new pool creations (tokens listing directly)
     try:
-        sigs = await rpc(session, "getSignaturesForAddress", [
-            "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", {"limit": 60}
-        ])
-        for s in (sigs or [])[:20]:
+        sigs = await rpc(session, "getSignaturesForAddress", [RAYDIUM_PROGRAM, {"limit": 20}])
+        for s in (sigs or [])[:10]:
             try:
                 tx = await rpc(session, "getTransaction", [
                     s["signature"],
@@ -483,19 +670,478 @@ async def fetch_new_tokens(session) -> list:
                 if not tx:
                     continue
                 msg  = tx.get("transaction", {}).get("message", {})
-                keys = [a.get("pubkey","") if isinstance(a,dict) else str(a)
-                        for a in msg.get("accountKeys", [])]
+                keys = [
+                    a.get("pubkey","") if isinstance(a,dict) else str(a)
+                    for a in msg.get("accountKeys", [])
+                ]
+                # New Raydium pool = token listing directly on DEX
                 for ix in msg.get("instructions", []):
                     p = ix.get("parsed", {})
                     if isinstance(p, dict) and p.get("type") == "initializeMint":
                         mint = p.get("info", {}).get("mint")
                         if mint and mint not in seen_mints:
-                            mints.append((mint, detect_launchpad(keys)))
+                            mints.append((mint, ("Raydium LaunchLab", "🔵"), "launch"))
             except Exception:
                 continue
     except Exception as e:
-        log.warning(f"fetch_new_tokens: {e}")
-    return mints[:12]
+        log.debug(f"Scanner1 Raydium: {e}")
+
+    return mints[:15]
+
+
+# ── SCANNER 2: Momentum scanner (any-age tokens) ──────────────────────────────
+async def scanner2_momentum(session) -> list:
+    """
+    Detect tokens of ANY age that are suddenly gaining momentum.
+    Strategy:
+      - Sample recent DEX activity from Raydium & PumpSwap
+      - For each token seen, track volume samples over time
+      - Alert when: volume accelerating + new unique buyers + price still reasonable
+    """
+    candidates = []
+    try:
+        # Get recent Raydium swap transactions — these are real trades
+        sigs = await rpc(session, "getSignaturesForAddress", [
+            RAYDIUM_PROGRAM, {"limit": 50}
+        ])
+        token_activity = defaultdict(lambda: {"txs": 0, "slots": []})
+
+        for s in (sigs or [])[:30]:
+            try:
+                tx = await rpc(session, "getTransaction", [
+                    s["signature"],
+                    {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}
+                ])
+                if not tx:
+                    continue
+                slot = tx.get("slot", 0)
+                # Extract token mints from post token balances
+                post_balances = tx.get("meta", {}).get("postTokenBalances", [])
+                for bal in post_balances:
+                    mint = bal.get("mint")
+                    if not mint:
+                        continue
+                    # Skip stablecoins and wrapped SOL
+                    if mint in {
+                        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+                        "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
+                        "So11111111111111111111111111111111111111112",    # wSOL
+                    }:
+                        continue
+                    token_activity[mint]["txs"] += 1
+                    token_activity[mint]["slots"].append(slot)
+            except Exception:
+                continue
+
+        # Score each token by momentum signals
+        now = datetime.now(timezone.utc)
+        for mint, activity in token_activity.items():
+            if mint in seen_mints:
+                continue
+            txs   = activity["txs"]
+            slots = activity["slots"]
+
+            # Need at least 3 txs to have a signal
+            if txs < 3:
+                continue
+
+            # Track across scans
+            if mint not in momentum_tracker:
+                momentum_tracker[mint] = {
+                    "samples":    [],
+                    "first_seen": now,
+                    "launchpad":  ("Raydium", "🔵"),
+                    "alerted":    False,
+                }
+
+            entry = momentum_tracker[mint]
+            if entry.get("alerted"):
+                continue
+
+            entry["samples"].append({"txs": txs, "time": now, "slots": slots})
+            # Keep only last 10 samples
+            entry["samples"] = entry["samples"][-10:]
+
+            # Need at least 2 samples to measure acceleration
+            if len(entry["samples"]) < 2:
+                continue
+
+            prev_txs    = entry["samples"][-2]["txs"]
+            current_txs = entry["samples"][-1]["txs"]
+
+            # Momentum trigger: activity at least doubled since last scan
+            # OR sustained high activity (10+ txs seen in one scan window)
+            momentum_score = 0
+            momentum_reason = ""
+
+            if current_txs >= prev_txs * 2 and current_txs >= 4:
+                momentum_score  = 80
+                momentum_reason = f"volume 2x spike ({prev_txs}→{current_txs} txs)"
+            elif current_txs >= 6:
+                momentum_score  = 65
+                momentum_reason = f"high sustained activity ({current_txs} txs)"
+            elif current_txs >= prev_txs * 1.5 and current_txs >= 3:
+                momentum_score  = 55
+                momentum_reason = f"growing activity ({prev_txs}→{current_txs} txs)"
+
+            if momentum_score >= 65:
+                candidates.append((mint, entry["launchpad"], "momentum", momentum_reason, momentum_score))
+                log.info(f"Momentum candidate: {mint[:8]} — {momentum_reason}")
+
+    except Exception as e:
+        log.warning(f"Scanner2: {e}")
+
+    return candidates[:8]
+
+
+# ── Process and alert a token ──────────────────────────────────────────────────
+async def process_token(session, bot: Bot, mint: str, launchpad: tuple,
+                        source: str, extra: dict = None):
+    """Enrich, score and conditionally alert on a single token."""
+    info = await enrich_token(session, mint, launchpad)
+    if not info:
+        return False
+
+    result = score_token(info)
+    score  = result["total"]
+    lp_name, _ = launchpad
+
+    log.info(
+        f"[{source}] {mint[:8]} score={score} "
+        f"rug={result['rug_risk']} lp={lp_name} fail={result['hard_fail']}"
+    )
+
+    if score < alert_threshold or result["hard_fail"]:
+        return False
+
+    # Build alert with source tag
+    source_tag = {
+        "launch":   "🆕 *NEW LAUNCH*",
+        "momentum": "📊 *MOMENTUM DETECTED*",
+        "trending": "🔥 *TRENDING — BUY SIGNAL*",
+    }.get(source, "🔍 *SIGNAL*")
+
+    momentum_note = ""
+    if source == "momentum" and extra:
+        momentum_note = f"*Momentum:* {extra.get('reason','')}\n\n"
+
+    text = format_alert(mint, info, result)
+    # Inject source tag and momentum note after first line
+    lines = text.split("\n", 1)
+    text  = lines[0] + "\n" + source_tag + "\n" + momentum_note + (lines[1] if len(lines)>1 else "")
+
+    await bot.send_message(
+        chat_id=TELEGRAM_CHAT_ID,
+        text=text,
+        parse_mode="Markdown",
+        disable_web_page_preview=True
+    )
+    tracked_alerts[mint] = {
+        "score": score, "time": datetime.now(timezone.utc),
+        "launchpad": launchpad, "reported": False, "source": source
+    }
+    daily_top.append({"mint": mint, "score": score, "launchpad": launchpad, "source": source})
+
+    if source == "momentum" and mint in momentum_tracker:
+        momentum_tracker[mint]["alerted"] = True
+
+    return True
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SCANNER 3: Trending token detector
+# Sources: DexScreener trending + Birdeye top tokens
+# Gates:   volume accelerating, mcap < $5M, price not already pumped,
+#          liquidity > $10K, full 10-signal safety check
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Tunable limits (can expose as env vars later)
+TRENDING_MAX_MCAP_USD    = float(os.environ.get("TRENDING_MAX_MCAP",    "5000000"))   # $5M
+TRENDING_MIN_LIQ_USD     = float(os.environ.get("TRENDING_MIN_LIQ",     "10000"))     # $10K
+TRENDING_MAX_PUMP_1H_PCT = float(os.environ.get("TRENDING_MAX_PUMP_1H", "500"))       # 500%
+TRENDING_MIN_VOL_USD     = float(os.environ.get("TRENDING_MIN_VOL",     "5000"))      # $5K 24h vol
+
+async def scanner3_trending(session) -> list:
+    """
+    Pull trending Solana tokens from DexScreener and Birdeye.
+    Apply 6-gate filter before returning candidates.
+    Only returns tokens that are worth buying RIGHT NOW.
+    """
+    candidates = []
+    seen_this_scan = set()
+
+    # ── Source A: DexScreener trending profiles ────────────────────────────────
+    try:
+        async with session.get(
+            "https://api.dexscreener.com/token-profiles/latest/v1",
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 200:
+                items = await r.json()
+                for item in (items or [])[:30]:
+                    if item.get("chainId") != "solana":
+                        continue
+                    mint = item.get("tokenAddress", "")
+                    if not mint or mint in seen_mints or mint in seen_this_scan:
+                        continue
+                    seen_this_scan.add(mint)
+                    candidates.append((mint, ("DexScreener Trending", "🔥"), "trending"))
+    except Exception as e:
+        log.debug(f"Scanner3 DexScreener profiles: {e}")
+
+    # ── Source B: DexScreener boosted tokens (paid attention = community active) ─
+    try:
+        async with session.get(
+            "https://api.dexscreener.com/token-boosts/latest/v1",
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 200:
+                items = await r.json()
+                for item in (items or [])[:20]:
+                    if item.get("chainId") != "solana":
+                        continue
+                    mint = item.get("tokenAddress", "")
+                    if not mint or mint in seen_mints or mint in seen_this_scan:
+                        continue
+                    seen_this_scan.add(mint)
+                    candidates.append((mint, ("DexScreener Boosted", "⚡"), "trending"))
+    except Exception as e:
+        log.debug(f"Scanner3 DexScreener boosts: {e}")
+
+    # ── Source C: DexScreener new pairs with volume on Solana ─────────────────
+    try:
+        async with session.get(
+            "https://api.dexscreener.com/latest/dex/search?q=SOL",
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 200:
+                data  = await r.json()
+                pairs = data.get("pairs") or []
+                # Sort by 1h volume change
+                sol_pairs = [
+                    p for p in pairs
+                    if p.get("chainId") == "solana"
+                    and p.get("baseToken", {}).get("address") not in seen_mints
+                ]
+                sol_pairs.sort(
+                    key=lambda p: abs(float(p.get("priceChange", {}).get("h1") or 0)),
+                    reverse=True
+                )
+                for p in sol_pairs[:15]:
+                    mint = p.get("baseToken", {}).get("address", "")
+                    if not mint or mint in seen_this_scan:
+                        continue
+                    seen_this_scan.add(mint)
+                    candidates.append((mint, ("DexScreener Pairs", "📊"), "trending"))
+    except Exception as e:
+        log.debug(f"Scanner3 DexScreener pairs: {e}")
+
+    log.info(f"Scanner3 raw candidates: {len(candidates)}")
+
+    # ── Apply 6-gate filter ────────────────────────────────────────────────────
+    actionable = []
+    for mint, launchpad, source in candidates:
+        if mint in seen_mints:
+            continue
+        try:
+            # Fetch price data first — cheapest gate, filters most tokens
+            px = await fetch_price_data(session, mint)
+            if not px.get("found"):
+                continue
+
+            mcap     = float(px.get("mcap")    or 0)
+            liq      = float(px.get("liquidity") or 0)
+            vol_24h  = float(px.get("volume_24h") or 0)
+            chg_1h   = float(px.get("price_change_1h")  or 0)
+            chg_5m   = float(px.get("price_change_5m")  or 0)
+            chg_24h  = float(px.get("price_change_24h") or 0)
+
+            fail_reason = None
+
+            # Gate 1 — Market cap ceiling (still early enough)
+            if mcap > TRENDING_MAX_MCAP_USD:
+                fail_reason = f"mcap ${mcap/1e6:.1f}M > ${TRENDING_MAX_MCAP_USD/1e6:.0f}M ceiling"
+
+            # Gate 2 — Already pumped too hard (you've missed it)
+            elif chg_1h > TRENDING_MAX_PUMP_1H_PCT:
+                fail_reason = f"already up {chg_1h:.0f}% in 1h — too late"
+
+            # Gate 3 — Minimum liquidity (can actually enter/exit)
+            elif liq < TRENDING_MIN_LIQ_USD:
+                fail_reason = f"liquidity ${liq:.0f} < ${TRENDING_MIN_LIQ_USD:.0f} minimum"
+
+            # Gate 4 — Minimum volume (real interest, not ghost)
+            elif vol_24h < TRENDING_MIN_VOL_USD:
+                fail_reason = f"volume ${vol_24h:.0f} too low"
+
+            # Gate 5 — Must be going UP, not dumping
+            elif chg_5m < -15:
+                fail_reason = f"dumping {chg_5m:.1f}% in 5m — skip"
+
+            # Gate 6 — Momentum must be accelerating (5m positive, not topped)
+            elif chg_24h > 1000 and chg_1h < 0:
+                fail_reason = f"24h pump {chg_24h:.0f}% but 1h negative — topped out"
+
+            if fail_reason:
+                log.debug(f"Scanner3 gate fail {mint[:8]}: {fail_reason}")
+                continue
+
+            # Track across scans for volume acceleration check
+            now = datetime.now(timezone.utc)
+            if mint not in trending_tracker:
+                trending_tracker[mint] = {
+                    "snapshots":  [],
+                    "first_seen": now,
+                    "alerted":    False,
+                }
+            entry = trending_tracker[mint]
+            if entry.get("alerted"):
+                continue
+
+            entry["snapshots"].append({
+                "vol": vol_24h, "mcap": mcap,
+                "chg_5m": chg_5m, "chg_1h": chg_1h,
+                "time": now
+            })
+            entry["snapshots"] = entry["snapshots"][-6:]
+
+            # Need at least 2 snapshots to confirm trend is holding
+            if len(entry["snapshots"]) < 2:
+                log.debug(f"Scanner3 {mint[:8]}: first sighting, waiting for confirmation")
+                continue
+
+            prev_vol  = entry["snapshots"][-2]["vol"]
+            prev_chg  = entry["snapshots"][-2]["chg_1h"]
+
+            # Volume must be growing OR already substantial
+            vol_growing = vol_24h >= prev_vol * 1.1 or vol_24h > 50000
+
+            if not vol_growing:
+                log.debug(f"Scanner3 {mint[:8]}: volume not growing ({prev_vol:.0f}→{vol_24h:.0f})")
+                continue
+
+            # Build entry reason for alert
+            reasons = []
+            if chg_5m > 5:   reasons.append(f"5m: +{chg_5m:.1f}%")
+            if chg_1h > 10:  reasons.append(f"1h: +{chg_1h:.1f}%")
+            if chg_24h > 0:  reasons.append(f"24h: +{chg_24h:.1f}%")
+            reasons.append(f"MCap: {fmt_usd(mcap)}")
+            reasons.append(f"Liq: {fmt_usd(liq)}")
+            if vol_24h > prev_vol * 1.5:
+                reasons.append(f"Vol +{((vol_24h/prev_vol-1)*100):.0f}% vs last scan")
+
+            actionable.append((
+                mint, launchpad, "trending",
+                {"reason": " | ".join(reasons), "px": px}
+            ))
+            log.info(f"Scanner3 actionable: {mint[:8]} — {' | '.join(reasons)}")
+
+        except Exception as e:
+            log.debug(f"Scanner3 gate check {mint[:8]}: {e}")
+            continue
+
+    return actionable[:6]  # cap at 6 per scan to avoid alert spam
+
+# ── Main scan loop (triple scanner) ─────────────────────────────────────────────
+async def scan_loop(bot: Bot):
+    last_summary_hour = -1
+    scan_count        = 0
+
+    async with aiohttp.ClientSession() as session:
+        while True:
+            scan_count += 1
+            log.info(f"═══ Scan #{scan_count} ═══")
+
+            try:
+                # Run all three scanners in parallel
+                launches, momentum, trending = await asyncio.gather(
+                    scanner1_new_launches(session),
+                    scanner2_momentum(session),
+                    scanner3_trending(session),
+                )
+                log.info(f"Scanner1: {len(launches)} | Scanner2: {len(momentum)} | Scanner3: {len(trending)}")
+
+                alerted = 0
+
+                # Process new launches
+                for item in launches:
+                    mint, launchpad = item[0], item[1]
+                    if mint in seen_mints:
+                        continue
+                    seen_mints.add(mint)
+                    fired = await process_token(session, bot, mint, launchpad, "launch")
+                    if fired:
+                        alerted += 1
+                        await asyncio.sleep(1.5)
+
+                # Process momentum candidates
+                for item in momentum:
+                    mint, launchpad, source, reason, mscore = item
+                    if mint in seen_mints:
+                        continue
+                    seen_mints.add(mint)
+                    fired = await process_token(
+                        session, bot, mint, launchpad, "momentum",
+                        extra={"reason": reason, "score": mscore}
+                    )
+                    if fired:
+                        alerted += 1
+                        await asyncio.sleep(1.5)
+
+                # Process trending candidates
+                for item in trending:
+                    mint, launchpad, source, extra = item
+                    if mint in seen_mints:
+                        continue
+                    seen_mints.add(mint)
+                    fired = await process_token(
+                        session, bot, mint, launchpad, "trending",
+                        extra=extra
+                    )
+                    if fired:
+                        alerted += 1
+                        if mint in trending_tracker:
+                            trending_tracker[mint]["alerted"] = True
+                        await asyncio.sleep(1.5)
+
+                # Housekeeping
+                await scan_watchlist(session, bot)
+                await check_copy_signals(bot)
+                if scan_count % 10 == 0:
+                    await check_performance(bot, session)
+                # Clean up old momentum tracker entries (> 2 hours old)
+                if scan_count % 30 == 0:
+                    cutoff = datetime.now(timezone.utc)
+                    stale  = [
+                        m for m, d in momentum_tracker.items()
+                        if (cutoff - d["first_seen"]).total_seconds() > 7200
+                    ]
+                    for m in stale:
+                        momentum_tracker.pop(m, None)
+                    if stale:
+                        log.info(f"Cleaned {len(stale)} stale momentum entries")
+                    # Clean stale trending entries
+                    stale_t = [
+                        m for m, d in trending_tracker.items()
+                        if (cutoff - d["first_seen"]).total_seconds() > 3600
+                    ]
+                    for m in stale_t:
+                        trending_tracker.pop(m, None)
+
+                hour = datetime.now(timezone.utc).hour
+                if hour == 9 and last_summary_hour != 9:
+                    await send_daily_summary(bot)
+                    last_summary_hour = 9
+                elif hour != 9:
+                    last_summary_hour = hour
+
+                log.info(f"Scan #{scan_count} done — {alerted} alerts fired")
+
+            except Exception as e:
+                log.error(f"Scan loop error: {e}")
+
+            await asyncio.sleep(SCAN_INTERVAL)
 
 # ── Watchlist scanner ──────────────────────────────────────────────────────────
 async def scan_watchlist(session, bot: Bot):
@@ -583,15 +1229,29 @@ def format_alert(mint: str, info: dict, result: dict) -> str:
     liq       = info.get("liquidity", {})
     mom       = info.get("momentum", {})
     h         = info.get("holders", {})
+    px        = info.get("price", {})
 
     boosts_txt   = "\n".join(result["boosts"])   or "—"
     warnings_txt = "\n".join(result["warnings"]) or "—"
+
+    price_block = ""
+    if px and px.get("found"):
+        price_block = (
+            f"*Price:* {fmt_usd(px.get('price_usd'))}  "
+            f"MCap: {fmt_usd(px.get('mcap'))}\n"
+            f"*Volume 24h:* {fmt_usd(px.get('volume_24h'))}  "
+            f"Liq: {fmt_usd(px.get('liquidity'))}\n"
+            f"*Change:* 5m {fmt_pct(px.get('price_change_5m'))}  "
+            f"1h {fmt_pct(px.get('price_change_1h'))}  "
+            f"24h {fmt_pct(px.get('price_change_24h'))}\n\n"
+        )
 
     return (
         f"🚨 *AlphaScan Alert*\n\n"
         f"*Launchpad:* {lp_emoji} {lp_name}\n"
         f"*Token:* `{mint}`\n"
-        f"*Score:* {score}/99  `{bar}`\n\n"
+        f"*Score:* {score}/99  `{bar}`\n"
+        f"{price_block}"
         f"*Breakdown:*\n"
         f"  🐋 Smart money:   {bd.get('smart_money',0)}/25\n"
         f"  📊 Distribution:  {bd.get('distribution',0)}/20\n"
@@ -632,7 +1292,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/summary — today's top tokens\n"
         "/status — bot health & settings\n"
         "/analyze `<CA>` — analyze any token on demand\n"
-        "Or just *paste any CA* directly into chat\n",
+        "Or just *paste any CA* directly into chat\n"
+        "/blacklist — view/add blacklisted deployers\n",
         parse_mode="Markdown"
     )
 
@@ -686,6 +1347,25 @@ async def cmd_addwallet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
+
+async def cmd_blacklist(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show or manually add to the auto-blacklist."""
+    if ctx.args:
+        addr = ctx.args[0]
+        blacklisted_devs.add(addr)
+        await update.message.reply_text(
+            f"🚫 Added to blacklist\n`{addr[:8]}...{addr[-4:]}`",
+            parse_mode="Markdown"
+        )
+    else:
+        if not blacklisted_devs:
+            await update.message.reply_text("Blacklist is empty — auto-populated as rugs are detected.")
+            return
+        lines = ["🚫 *Blacklisted deployers:*\n"]
+        for addr in list(blacklisted_devs)[:20]:
+            lines.append(f"• `{addr[:8]}...{addr[-4:]}`")
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
 async def cmd_summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await send_daily_summary(ctx.bot)
 
@@ -704,7 +1384,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"✅ Dev rug history\n✅ Liquidity depth\n"
         f"✅ Price momentum\n✅ Smart money\n"
         f"✅ Holder distribution\n✅ TX velocity\n"
-        f"✅ Graduation tracking\n",
+        f"✅ Graduation tracking\n✅ DexScreener price data\n✅ Auto-blacklist ruggers\n✅ Multi-wallet copy signal\n",
         parse_mode="Markdown"
     )
 
@@ -747,6 +1427,7 @@ async def scan_loop(bot: Bot):
                         await asyncio.sleep(1.5)
 
                 await scan_watchlist(session, bot)
+                await check_copy_signals(bot)
                 if scan_count % 10 == 0:
                     await check_performance(bot, session)
 
@@ -842,11 +1523,25 @@ async def run_analysis(update: Update, mint: str):
             boosts_txt   = "\n".join(result["boosts"])   or "None"
             warnings_txt = "\n".join(result["warnings"]) or "None"
 
+            px = info.get("price", {})
+            price_block = ""
+            if px and px.get("found"):
+                price_block = (
+                    f"*Price:* {fmt_usd(px.get('price_usd'))}  "
+                    f"MCap: {fmt_usd(px.get('mcap'))}\n"
+                    f"*Volume 24h:* {fmt_usd(px.get('volume_24h'))}  "
+                    f"Liq: {fmt_usd(px.get('liquidity'))}\n"
+                    f"*Change:* 5m {fmt_pct(px.get('price_change_5m'))}  "
+                    f"1h {fmt_pct(px.get('price_change_1h'))}  "
+                    f"24h {fmt_pct(px.get('price_change_24h'))}\n\n"
+                )
+
             report = (
                 f"🔬 *Token Analysis Report*\n\n"
                 f"*CA:* `{mint}`\n"
                 f"*Launchpad:* {lp_emoji} {lp_name}\n"
                 f"*Score:* {score}/99  `{bar}`\n"
+                f"{price_block}"
                 f"*Verdict:* {verdict}\n\n"
                 f"*Score breakdown:*\n"
                 f"  🐋 Smart money:   {bd.get('smart_money',0)}/25\n"
@@ -899,6 +1594,7 @@ def main():
         ("summary",   cmd_summary),
         ("status",    cmd_status),
         ("analyze",   cmd_analyze),
+        ("blacklist",  cmd_blacklist),
     ]:
         app.add_handler(CommandHandler(cmd, handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
