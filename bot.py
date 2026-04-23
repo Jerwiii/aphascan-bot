@@ -151,12 +151,19 @@ async def get_asset(session, mint: str) -> dict:
         return {}
 
 # ── Signal 1: Mint & Freeze authority check ────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SIGNAL FUNCTIONS — rebuilt with correct logic
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Signal 1: Mint & Freeze authority ─────────────────────────────────────────
 async def check_authorities(session, mint: str) -> dict:
     """
-    CRITICAL safety check.
-    Mint authority = dev can print infinite tokens and dump on you.
-    Freeze authority = dev can freeze your wallet so you can't sell.
-    Both should be null/revoked on a safe token.
+    Mint authority = dev can print infinite tokens.
+    Freeze authority = dev can freeze your wallet so you cannot sell.
+    Both MUST be revoked for a safe token.
+    On Pump.fun tokens, both are revoked at graduation.
+    On brand new tokens, they may still be active — that is normal but risky.
     """
     result = {
         "mint_authority":   "unknown",
@@ -169,112 +176,156 @@ async def check_authorities(session, mint: str) -> dict:
         info = await rpc(session, "getAccountInfo", [mint, {"encoding": "jsonParsed"}])
         if not info or not info.get("value"):
             return result
-        parsed = info["value"].get("data", {}).get("parsed", {}).get("info", {})
+        parsed      = info["value"].get("data", {}).get("parsed", {}).get("info", {})
         mint_auth   = parsed.get("mintAuthority")
         freeze_auth = parsed.get("freezeAuthority")
         result["mint_authority"]   = mint_auth   or "revoked"
         result["freeze_authority"] = freeze_auth or "revoked"
-        result["mint_revoked"]     = mint_auth is None
+        result["mint_revoked"]     = mint_auth   is None
         result["freeze_revoked"]   = freeze_auth is None
         result["safe"]             = (mint_auth is None) and (freeze_auth is None)
     except Exception as e:
         log.debug(f"Authority check {mint[:8]}: {e}")
     return result
 
-# ── Signal 2: Liquidity depth ──────────────────────────────────────────────────
-async def check_liquidity(session, mint: str) -> dict:
-    """
-    Fetch pool accounts associated with the token to estimate liquidity.
-    Uses largest token accounts as a proxy — the biggest non-deployer account
-    is likely a DEX pool. More SOL in pool = harder to move price / less rug risk.
-    """
-    result = {"pool_found": False, "liquidity_tier": "unknown", "score": 0}
-    try:
-        largest = await rpc(session, "getTokenLargestAccounts", [mint])
-        if not largest or not largest.get("value"):
-            return result
-        accounts = largest["value"]
-        # Largest account by token amount — likely the LP pool
-        if accounts:
-            top_amount = float(accounts[0].get("uiAmount") or 0)
-            supply_res = await rpc(session, "getTokenSupply", [mint])
-            total = float((supply_res or {}).get("value", {}).get("uiAmount") or 1)
-            pool_pct = (top_amount / total * 100) if total > 0 else 0
 
-            # Pool holding 20-60% of supply is healthy for a new token
-            if 20 <= pool_pct <= 70:
-                result["pool_found"]      = True
-                result["liquidity_tier"]  = "good"
-                result["score"]           = 10
-            elif 10 <= pool_pct < 20:
-                result["pool_found"]      = True
-                result["liquidity_tier"]  = "thin"
-                result["score"]           = 5
-            else:
-                result["liquidity_tier"]  = "very thin"
-                result["score"]           = 0
-            result["pool_pct"] = round(pool_pct, 1)
+# ── Signal 2: Real liquidity from DexScreener ─────────────────────────────────
+async def check_liquidity(session, mint: str, price_data: dict) -> dict:
+    """
+    Use DexScreener liquidity USD value — this is ACTUAL SOL in the pool,
+    not token holdings. Much more accurate than on-chain token account proxies.
+    Tiers:
+      $50K+  = deep      (10 pts) — you can enter/exit freely
+      $20K+  = solid     (7 pts)
+      $10K+  = adequate  (4 pts)
+      $5K+   = thin      (2 pts)
+      <$5K   = too thin  (0 pts) — hard to exit without moving price
+    """
+    result = {"pool_found": False, "liquidity_usd": 0, "liquidity_tier": "unknown",
+              "score": 0, "pool_pct": 0}
+    try:
+        liq_usd = float(price_data.get("liquidity") or 0)
+        result["liquidity_usd"] = liq_usd
+        result["pool_found"]    = liq_usd > 0
+        if liq_usd >= 50000:
+            result.update({"liquidity_tier": "deep",     "score": 10})
+        elif liq_usd >= 20000:
+            result.update({"liquidity_tier": "solid",    "score": 7})
+        elif liq_usd >= 10000:
+            result.update({"liquidity_tier": "adequate", "score": 4})
+        elif liq_usd >= 5000:
+            result.update({"liquidity_tier": "thin",     "score": 2})
+        else:
+            result.update({"liquidity_tier": "very thin","score": 0})
     except Exception as e:
         log.debug(f"Liquidity check {mint[:8]}: {e}")
     return result
 
-# ── Signal 3: Bundle / coordinated buy detection ───────────────────────────────
+
+# ── Signal 3: Bundle detection (improved) ─────────────────────────────────────
 def detect_bundling(sigs: list) -> dict:
     """
-    Bundled launches have bots buying in the same or adjacent slots.
-    This detects coordinated entry which signals artificial demand.
+    Improved bundling detection.
+    Real bundling = multiple buys landing in same AND adjacent slots (within 3 slots).
+    Single-slot threshold raised to avoid false positives on popular tokens.
+    Also checks for suspiciously uniform transaction spacing — bot signature.
     """
     if not sigs:
         return {"is_bundled": False, "confidence": 0, "reason": "no data"}
+
     slot_counts = defaultdict(int)
     for s in sigs:
         slot_counts[s.get("slot", 0)] += 1
-    max_slot = max(slot_counts.values()) if slot_counts else 0
-    if max_slot >= 6:
-        return {"is_bundled": True,  "confidence": min(100, max_slot * 12),
-                "reason": f"{max_slot} txs in one block"}
-    elif max_slot >= 3:
-        return {"is_bundled": False, "confidence": max_slot * 8,
-                "reason": f"mild clustering ({max_slot}/block)"}
+
+    # Check adjacent slot clusters (within 3 slots = same bundle window)
+    slots = sorted(slot_counts.keys())
+    max_cluster = 0
+    for i, slot in enumerate(slots):
+        cluster = sum(slot_counts[s] for s in slots if abs(s - slot) <= 3)
+        max_cluster = max(max_cluster, cluster)
+
+    if max_cluster >= 8:
+        return {"is_bundled": True,  "confidence": min(100, max_cluster * 10),
+                "reason": f"{max_cluster} coordinated txs in 3-slot window"}
+    elif max_cluster >= 5:
+        return {"is_bundled": False, "confidence": max_cluster * 8,
+                "reason": f"possible bundling ({max_cluster} near-simultaneous txs)"}
+
     return {"is_bundled": False, "confidence": 0, "reason": "organic"}
 
-# ── Signal 4: Dev wallet safety ────────────────────────────────────────────────
+
+# ── Signal 4: Dev wallet safety (corrected) ───────────────────────────────────
 async def check_dev_history(session, deployer: str) -> dict:
     """
-    Check how many tokens this deployer has launched.
-    Serial launchers are almost always running pump-and-dump operations.
+    FIXED: Raw tx count was wrong — traders have high tx counts legitimately.
+    Now we check how many unique token mints the deployer has initialized.
+    5+ token launches = serial deployer = very high risk.
+    We also check if deployer wallet is freshly funded (brand new = higher risk).
     """
     if not deployer:
-        return {"launches": 0, "is_serial": False, "risk": "unknown"}
+        return {"launches": 0, "is_serial": False, "risk": "unknown", "wallet_age": "unknown"}
     if deployer in dev_cache:
         return dev_cache[deployer]
-    result = {"launches": 0, "is_serial": False, "risk": "low"}
+
+    result = {"launches": 0, "is_serial": False, "risk": "low", "wallet_age": "unknown"}
     try:
         sigs = await rpc(session, "getSignaturesForAddress", [deployer, {"limit": 100}])
-        launches = len(sigs) if sigs else 0
-        result["launches"] = launches
-        if launches > 50:
+        if not sigs:
+            dev_cache[deployer] = result
+            return result
+
+        # Count initializeMint instructions from this deployer — real launch count
+        launch_count = 0
+        for s in sigs[:30]:
+            try:
+                tx = await rpc(session, "getTransaction", [
+                    s["signature"],
+                    {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}
+                ])
+                if not tx:
+                    continue
+                for ix in tx.get("transaction",{}).get("message",{}).get("instructions",[]):
+                    p = ix.get("parsed", {})
+                    if isinstance(p, dict) and p.get("type") == "initializeMint":
+                        launch_count += 1
+            except Exception:
+                continue
+
+        # Wallet age — check oldest transaction
+        oldest_sig = sigs[-1] if sigs else None
+        if oldest_sig and oldest_sig.get("blockTime"):
+            age_days = (datetime.now(timezone.utc).timestamp() - oldest_sig["blockTime"]) / 86400
+            if age_days < 1:    result["wallet_age"] = "brand new (<1 day)"
+            elif age_days < 7:  result["wallet_age"] = f"{int(age_days)}d old"
+            else:               result["wallet_age"] = f"{int(age_days)}d old"
+
+        result["launches"] = launch_count
+        if launch_count >= 5:
             result["is_serial"] = True
             result["risk"]      = "high"
-            blacklisted_devs.add(deployer)  # auto-blacklist serial ruggers
-        elif launches > 20:
-            result["risk"]      = "medium"
+            blacklisted_devs.add(deployer)
+        elif launch_count >= 2:
+            result["risk"] = "medium"
+
         dev_cache[deployer] = result
     except Exception as e:
         log.debug(f"Dev history {deployer[:8]}: {e}")
     return result
 
+
 # ── Signal 5: Smart money detection ───────────────────────────────────────────
 async def count_smart_buyers(session, sigs: list, mint: str = "") -> dict:
     """
-    Check how many known high-win-rate wallets bought this token early.
-    Even 1 smart wallet = meaningful signal. 3+ = very strong buy signal.
-    Also dynamically learns new smart wallets from the /addwallet command.
+    Check how many wallets from your smart money list bought early.
+    When smart money list is empty, score is 0 but does NOT penalise the token —
+    it simply means this signal is neutral, not negative.
     """
     result = {"count": 0, "wallets": [], "score": 0}
-    if not SMART_MONEY_SEEDS and not smart_wallet_db:
-        return result
     all_smart = SMART_MONEY_SEEDS | set(smart_wallet_db.keys())
+    if not all_smart:
+        result["score"] = 3  # Small neutral baseline when no list exists yet
+        return result
+
     checked = 0
     for sig_info in sigs[:25]:
         if checked >= 25:
@@ -297,83 +348,155 @@ async def count_smart_buyers(session, sigs: list, mint: str = "") -> dict:
             checked += 1
         except Exception:
             continue
+
     c = result["count"]
-    result["score"] = 25 if c >= 3 else 18 if c == 2 else 10 if c == 1 else 0
+    result["score"] = 25 if c >= 3 else 18 if c == 2 else 12 if c == 1 else 3
 
-    # Track copy signal — if 3+ smart wallets buy same token, fire special alert
-    if c >= 2:
+    # Copy signal tracker
+    if c >= 2 and mint:
         if mint not in copy_signal_cache:
-            copy_signal_cache[mint] = {"wallets": result["wallets"], "first_seen": datetime.now(timezone.utc), "alerted": False}
+            copy_signal_cache[mint] = {
+                "wallets": result["wallets"],
+                "first_seen": datetime.now(timezone.utc),
+                "alerted": False
+            }
         else:
-            copy_signal_cache[mint]["wallets"] = list(set(copy_signal_cache[mint]["wallets"] + result["wallets"]))
-
+            copy_signal_cache[mint]["wallets"] = list(
+                set(copy_signal_cache[mint]["wallets"] + result["wallets"])
+            )
     return result
 
-# ── Signal 6: Holder distribution ─────────────────────────────────────────────
+
+# ── Signal 6: Holder distribution (corrected) ─────────────────────────────────
 async def check_holders(session, mint: str) -> dict:
-    result = {"count": 0, "top1_pct": 100, "top3_pct": 100, "score": 0}
+    """
+    FIXED: Exclude the LP pool account from holder concentration calculation.
+    The LP pool legitimately holds large % of supply — it is not a whale.
+    We identify the LP by it being the single largest account by a wide margin.
+    Real holder concentration is calculated from accounts 2-20.
+    """
+    result = {"count": 0, "top1_pct": 0, "top3_pct": 0,
+              "real_top1_pct": 0, "score": 0, "lp_excluded": False}
     try:
         largest    = await rpc(session, "getTokenLargestAccounts", [mint])
         supply_res = await rpc(session, "getTokenSupply", [mint])
-        total = float((supply_res or {}).get("value", {}).get("uiAmount") or 1)
-        accounts = (largest or {}).get("value", [])
+        total      = float((supply_res or {}).get("value", {}).get("uiAmount") or 1)
+        accounts   = (largest or {}).get("value", [])
+        if not accounts:
+            return result
+
         result["count"] = len(accounts)
-        if accounts and total > 0:
-            result["top1_pct"] = round(float(accounts[0].get("uiAmount") or 0) / total * 100, 1)
-            result["top3_pct"] = round(
-                sum(float(a.get("uiAmount") or 0) for a in accounts[:3]) / total * 100, 1
-            )
-        t1 = result["top1_pct"]
-        if t1 < 5:   result["score"] = 20
-        elif t1 < 10: result["score"] = 15
-        elif t1 < 20: result["score"] = 9
-        elif t1 < 35: result["score"] = 4
-        else:         result["score"] = 0
+        amounts = [float(a.get("uiAmount") or 0) for a in accounts]
+
+        # Detect LP pool — if top account holds 2x more than second, it is likely the pool
+        lp_excluded = False
+        if len(amounts) >= 2 and amounts[0] > amounts[1] * 2 and (amounts[0]/total*100) > 20:
+            # Exclude account[0] as LP pool, score based on accounts 1+
+            real_accounts = amounts[1:]
+            lp_excluded   = True
+        else:
+            real_accounts = amounts
+
+        if not real_accounts or total <= 0:
+            return result
+
+        real_top1 = round(real_accounts[0] / total * 100, 1) if real_accounts else 0
+        real_top3 = round(sum(real_accounts[:3]) / total * 100, 1) if len(real_accounts) >= 3 else real_top1
+
+        result.update({
+            "top1_pct":      round(amounts[0] / total * 100, 1),
+            "top3_pct":      round(sum(amounts[:3]) / total * 100, 1),
+            "real_top1_pct": real_top1,
+            "lp_excluded":   lp_excluded,
+        })
+
+        # Score based on REAL top holder (excluding LP)
+        if real_top1 < 5:    result["score"] = 20
+        elif real_top1 < 10: result["score"] = 15
+        elif real_top1 < 20: result["score"] = 10
+        elif real_top1 < 35: result["score"] = 4
+        else:                result["score"] = 0
+
     except Exception as e:
         log.debug(f"Holders {mint[:8]}: {e}")
     return result
 
-# ── Signal 7: TX velocity & pattern ───────────────────────────────────────────
+
+# ── Signal 7: TX velocity ──────────────────────────────────────────────────────
 def score_velocity(sigs: list) -> dict:
+    """Raw tx count scoring. Paired with momentum for full picture."""
     count = len(sigs)
     if count > 300: score = 15
-    elif count > 100: score = 12
-    elif count > 40:  score = 8
-    elif count > 10:  score = 4
-    else:             score = 1
+    elif count > 150: score = 12
+    elif count > 60:  score = 9
+    elif count > 20:  score = 5
+    elif count > 5:   score = 2
+    else:             score = 0
     return {"count": count, "score": score}
 
-# ── Signal 8: Price momentum proxy ────────────────────────────────────────────
-async def check_price_momentum(session, mint: str, sigs: list) -> dict:
+
+# ── Signal 8: Price momentum (rebuilt) ────────────────────────────────────────
+async def check_price_momentum(session, mint: str, sigs: list, price_data: dict) -> dict:
     """
-    Estimate momentum by comparing tx density in first 10 vs last 10 sigs.
-    Accelerating activity = momentum. Decelerating = already peaked.
+    REBUILT: Now combines two sources:
+    1. On-chain TX slot speed (are transactions accelerating?)
+    2. DexScreener price change (is price actually going up?)
+    A token with rising TX speed but falling price = distribution = BAD.
+    A token with rising TX speed AND rising price = real momentum = GOOD.
+    Also checks volume/mcap ratio — one of the strongest early signals.
     """
-    result = {"momentum": "unknown", "score": 5, "note": ""}
+    result = {"momentum": "unknown", "score": 5, "note": "", "vol_mcap_ratio": 0}
     try:
-        if len(sigs) < 20:
-            result["note"] = "too new to judge"
-            return result
-        # Earlier sigs are more recent (getSignaturesForAddress returns newest first)
-        recent_slots  = [s.get("slot", 0) for s in sigs[:10]]
-        earlier_slots = [s.get("slot", 0) for s in sigs[10:20]]
-        recent_span  = max(recent_slots)  - min(recent_slots)  + 1
-        earlier_span = max(earlier_slots) - min(earlier_slots) + 1
-        # Lower slot span for same tx count = faster = accelerating
-        if recent_span < earlier_span * 0.7:
+        # On-chain speed check
+        onchain_accel = False
+        if len(sigs) >= 20:
+            recent_slots  = [s.get("slot",0) for s in sigs[:10]]
+            earlier_slots = [s.get("slot",0) for s in sigs[10:20]]
+            recent_span   = max(recent_slots)  - min(recent_slots)  + 1
+            earlier_span  = max(earlier_slots) - min(earlier_slots) + 1
+            onchain_accel = recent_span < earlier_span * 0.75
+
+        # Price direction check
+        chg_1h  = float(price_data.get("price_change_1h")  or 0)
+        chg_5m  = float(price_data.get("price_change_5m")  or 0)
+        vol     = float(price_data.get("volume_24h") or 0)
+        mcap    = float(price_data.get("mcap")        or 1)
+        vol_mcap_ratio = round(vol / mcap, 2) if mcap > 0 else 0
+        result["vol_mcap_ratio"] = vol_mcap_ratio
+
+        # Score combining all signals
+        if onchain_accel and chg_1h > 10 and chg_5m > 0:
             result.update({"momentum": "accelerating", "score": 10,
-                           "note": "TX speed increasing"})
-        elif recent_span > earlier_span * 1.5:
-            result.update({"momentum": "decelerating", "score": 2,
-                           "note": "TX speed slowing — may have already peaked"})
+                           "note": f"TX speed up + price +{chg_1h:.1f}% 1h"})
+        elif onchain_accel and chg_5m > 0:
+            result.update({"momentum": "accelerating", "score": 8,
+                           "note": "TX speed increasing, price positive"})
+        elif chg_1h > 20 and chg_5m > 0:
+            result.update({"momentum": "price_led", "score": 7,
+                           "note": f"Price +{chg_1h:.1f}% 1h"})
+        elif vol_mcap_ratio > 1.5:
+            result.update({"momentum": "high_volume", "score": 8,
+                           "note": f"Vol/MCap ratio {vol_mcap_ratio:.1f}x — very active"})
+        elif vol_mcap_ratio > 0.5:
+            result.update({"momentum": "moderate", "score": 5,
+                           "note": f"Vol/MCap ratio {vol_mcap_ratio:.1f}x"})
+        elif onchain_accel and chg_1h < -10:
+            result.update({"momentum": "distribution", "score": 1,
+                           "note": "TX up but price falling — likely being dumped"})
+        elif chg_1h < -15:
+            result.update({"momentum": "dumping", "score": 0,
+                           "note": f"Price -{ abs(chg_1h):.1f}% 1h — avoid"})
         else:
-            result.update({"momentum": "steady", "score": 6, "note": "steady activity"})
-    except Exception:
-        pass
+            result.update({"momentum": "neutral", "score": 4, "note": "no strong signal"})
+
+    except Exception as e:
+        log.debug(f"Price momentum {mint[:8]}: {e}")
     return result
+
 
 # ── Signal 9: Graduation check ────────────────────────────────────────────────
 async def check_graduation(session, mint: str) -> bool:
+    """Checks if token has graduated from Pump.fun bonding curve to PumpSwap AMM."""
     try:
         sigs = await rpc(session, "getSignaturesForAddress", [mint, {"limit": 30}])
         for s in (sigs or [])[:8]:
@@ -393,35 +516,38 @@ async def check_graduation(session, mint: str) -> bool:
         pass
     return False
 
+
 # ── Full token enrichment ──────────────────────────────────────────────────────
 async def enrich_token(session, mint: str, launchpad: tuple) -> dict | None:
     try:
-        # Fire all independent fetches in parallel
+        # Fetch price data first — used by multiple downstream signals
+        price = await fetch_price_data(session, mint)
+
+        # Parallel base fetches
         sigs_res, acct_res = await asyncio.gather(
             rpc(session, "getSignaturesForAddress", [mint, {"limit": 100}]),
             rpc(session, "getAccountInfo", [mint, {"encoding": "jsonParsed"}]),
         )
-        sigs = sigs_res or []
-
-        # Get deployer from account owner
+        sigs     = sigs_res or []
         deployer = ""
         if acct_res and acct_res.get("value"):
             deployer = acct_res["value"].get("owner", "")
 
-        # Fire remaining checks in parallel
-        (auth, liquidity, holders, smart, dev, momentum, graduated) = await asyncio.gather(
+        # All signal checks in parallel
+        (auth, holders, smart, dev, momentum, graduated) = await asyncio.gather(
             check_authorities(session, mint),
-            check_liquidity(session, mint),
             check_holders(session, mint),
             count_smart_buyers(session, sigs, mint),
             check_dev_history(session, deployer),
-            check_price_momentum(session, mint, sigs),
+            check_price_momentum(session, mint, sigs, price),
             check_graduation(session, mint),
         )
 
-        bundle = detect_bundling(sigs[:30])
+        # Liquidity now uses price data — no extra RPC needed
+        liquidity = await check_liquidity(session, mint, price)
+
+        bundle = detect_bundling(sigs[:50])
         vel    = score_velocity(sigs)
-        price  = await fetch_price_data(session, mint)
 
         return {
             "mint":       mint,
@@ -443,113 +569,220 @@ async def enrich_token(session, mint: str, launchpad: tuple) -> dict | None:
         log.warning(f"enrich_token {mint[:8]}: {e}")
         return None
 
-# ── Master scoring engine (110 pts possible, capped at 99) ────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SCORING ENGINE — rebuilt with correct weights and logic
+# Total: 100 points. Hard fails override everything.
+# ══════════════════════════════════════════════════════════════════════════════
 def score_token(info: dict) -> dict:
     score    = 0
     warnings = []
     boosts   = []
     bd       = {}
 
-    # 1. Smart money (25 pts)
-    sm = info["smart"]
-    score += sm["score"]; bd["smart_money"] = sm["score"]
-    if sm["count"] >= 3: boosts.append(f"🐋 {sm['count']} smart wallets in early")
-    elif sm["count"] > 0: boosts.append(f"🐋 {sm['count']} smart wallet(s) spotted")
+    px  = info.get("price",    {})
+    h   = info.get("holders",  {})
+    sm  = info.get("smart",    {})
+    b   = info.get("bundle",   {})
+    v   = info.get("velocity", {})
+    auth= info.get("auth",     {})
+    liq = info.get("liquidity",{})
+    dev = info.get("dev",      {})
+    mom = info.get("momentum", {})
 
-    # 2. Holder distribution (20 pts)
-    h = info["holders"]
-    score += h["score"]; bd["distribution"] = h["score"]
-    if h["top1_pct"] > 35: warnings.append(f"⚠️ Top holder owns {h['top1_pct']}%")
-    elif h["top1_pct"] < 5: boosts.append("✅ Healthy distribution")
-
-    # 3. Bundle detection (20 pts)
-    b = info["bundle"]
-    org_score = 0 if b["is_bundled"] else (10 if b["confidence"] > 20 else 20)
-    score += org_score; bd["organic"] = org_score
-    if b["is_bundled"]: warnings.append(f"🤖 Bundled: {b['reason']}")
-    elif org_score == 20: boosts.append("✅ Organic launch confirmed")
-
-    # 4. TX velocity (15 pts)
-    v = info["velocity"]
-    score += v["score"]; bd["tx_velocity"] = v["score"]
-    if v["count"] > 200: boosts.append(f"🔥 {v['count']} transactions")
-
-    # 5. Mint & freeze authority (10 pts) ← NEW
-    auth = info["auth"]
-    if auth["safe"]:
-        auth_score = 10; boosts.append("🔒 Mint & freeze authority revoked")
-    elif auth["mint_revoked"] or auth["freeze_revoked"]:
-        auth_score = 5; warnings.append("⚠️ Only one authority revoked")
+    # ── 1. Safety first: Mint & Freeze authority (20 pts) ─────────────────────
+    # Weighted highest because active authority = dev can instantly destroy value
+    if auth.get("safe"):
+        auth_score = 20
+        boosts.append("🔒 Both authorities revoked — safe")
+    elif auth.get("mint_revoked") and not auth.get("freeze_revoked"):
+        auth_score = 12
+        warnings.append("⚠️ Freeze authority still active — dev can freeze wallets")
+    elif auth.get("freeze_revoked") and not auth.get("mint_revoked"):
+        auth_score = 8
+        warnings.append("⚠️ Mint authority still active — dev can print tokens")
     else:
-        auth_score = 0; warnings.append("🚨 Mint/freeze authority still active — dev can rug")
+        auth_score = 0
+        warnings.append("🚨 Both authorities active — dev can print AND freeze")
     score += auth_score; bd["authority"] = auth_score
 
-    # 6. Liquidity depth (10 pts) ← NEW
-    liq = info["liquidity"]
-    score += liq["score"]; bd["liquidity"] = liq["score"]
-    if liq["liquidity_tier"] == "good": boosts.append("💧 Good liquidity depth")
-    elif liq["liquidity_tier"] == "very thin": warnings.append("⚠️ Very thin liquidity")
+    # ── 2. Real liquidity (15 pts) ────────────────────────────────────────────
+    # Real SOL in pool from DexScreener — not token balance proxies
+    liq_score = liq.get("score", 0)
+    score += liq_score; bd["liquidity"] = liq_score
+    tier = liq.get("liquidity_tier","unknown")
+    liq_usd = liq.get("liquidity_usd", 0)
+    if tier == "deep":     boosts.append(f"💧 Deep liquidity ${liq_usd:,.0f}")
+    elif tier == "solid":  boosts.append(f"💧 Solid liquidity ${liq_usd:,.0f}")
+    elif tier in ("very thin","unknown") and liq_usd < 5000:
+        warnings.append(f"⚠️ Very thin liquidity ${liq_usd:,.0f} — hard to exit")
 
-    # 7. Dev safety (10 pts)
-    dev = info["dev"]
-    if dev["is_serial"]:
-        dev_score = 0; warnings.append(f"🚨 Serial deployer — {dev['launches']} prior launches")
-    elif dev["risk"] == "medium":
-        dev_score = 5; warnings.append(f"⚠️ Dev has {dev['launches']} prior launches")
+    # ── 3. Holder distribution (15 pts) ───────────────────────────────────────
+    # LP-excluded real concentration
+    real_top1 = h.get("real_top1_pct", h.get("top1_pct", 100))
+    hd_score  = h.get("score", 0)
+    score += hd_score; bd["distribution"] = hd_score
+    if h.get("lp_excluded"):
+        boosts.append(f"📊 LP excluded — real top holder {real_top1}%")
+    if real_top1 > 35:
+        warnings.append(f"⚠️ Whale alert: real top holder owns {real_top1}%")
+    elif real_top1 < 5:
+        boosts.append("✅ Very healthy distribution")
+
+    # ── 4. Bundle/organic detection (15 pts) ──────────────────────────────────
+    if b.get("is_bundled"):
+        org_score = 0
+        warnings.append(f"🤖 Coordinated launch detected: {b.get('reason','')}")
+    elif b.get("confidence",0) > 30:
+        org_score = 7
+        warnings.append(f"🤖 Possible bot activity: {b.get('reason','')}")
+    else:
+        org_score = 15
+        boosts.append("✅ Organic launch")
+    score += org_score; bd["organic"] = org_score
+
+    # ── 5. Price momentum & vol/mcap ratio (15 pts) ───────────────────────────
+    mom_score = mom.get("score", 4)
+    score += mom_score; bd["momentum"] = mom_score
+    vol_mcap  = mom.get("vol_mcap_ratio", 0)
+    if mom.get("momentum") in ("accelerating","high_volume"):
+        boosts.append(f"📈 {mom.get('note','')}")
+    elif mom.get("momentum") in ("distribution","dumping"):
+        warnings.append(f"📉 {mom.get('note','')}")
+    if vol_mcap > 2:
+        boosts.append(f"🔥 Vol/MCap {vol_mcap:.1f}x — extremely active")
+    elif vol_mcap > 1:
+        boosts.append(f"📊 Vol/MCap {vol_mcap:.1f}x — strong volume")
+
+    # ── 6. Dev wallet safety (10 pts) ─────────────────────────────────────────
+    # Now uses real launch count, not raw tx count
+    if dev.get("is_serial"):
+        dev_score = 0
+        warnings.append(f"🚨 Serial token launcher — {dev.get('launches',0)} prior launches")
+    elif dev.get("risk") == "medium":
+        dev_score = 5
+        warnings.append(f"⚠️ Dev has launched {dev.get('launches',0)} tokens before")
     else:
         dev_score = 10
+    # Wallet age warning
+    age = dev.get("wallet_age","")
+    if "brand new" in age:
+        dev_score = max(0, dev_score - 3)
+        warnings.append(f"⚠️ Brand new deployer wallet — higher risk")
     score += dev_score; bd["dev_safety"] = dev_score
 
-    # 8. Price momentum (10 pts) ← NEW
-    mom = info["momentum"]
-    score += mom["score"]; bd["momentum"] = mom["score"]
-    if mom["momentum"] == "accelerating": boosts.append(f"📈 {mom['note']}")
-    elif mom["momentum"] == "decelerating": warnings.append(f"📉 {mom['note']}")
+    # ── 7. TX velocity (5 pts) ────────────────────────────────────────────────
+    # Kept lower weight — velocity alone doesn't mean much without price confirmation
+    vel_score = v.get("score", 0)
+    score += vel_score; bd["tx_velocity"] = vel_score
+    if v.get("count",0) > 150:
+        boosts.append(f"⚡ {v['count']} transactions — high activity")
 
-    # 9. Holder count (5 pts)
-    hc = 5 if h["count"] > 200 else 3 if h["count"] > 50 else 2 if h["count"] > 10 else 0
-    score += hc; bd["holder_count"] = hc
+    # ── 8. Smart money (5 pts base, up to 25 pts bonus) ───────────────────────
+    # Low base score when list is empty, full score when smart wallets detected
+    sm_score = sm.get("score", 3)
+    score += sm_score; bd["smart_money"] = sm_score
+    if sm.get("count",0) >= 3:
+        boosts.append(f"🐋 {sm['count']} smart wallets confirmed in")
+    elif sm.get("count",0) > 0:
+        boosts.append(f"🐋 {sm['count']} smart wallet spotted")
 
-    # 10. Graduation (5 pts)
+    # ── 9. Vol/MCap ratio bonus (up to 5 pts) ────────────────────────────────
+    # High volume relative to market cap = real trading interest before price
+    # discovery. One of the strongest early runner signals in memecoins.
+    vol_mcap = mom.get("vol_mcap_ratio", 0)
+    if vol_mcap >= 3.0:   vm_score = 5; boosts.append(f"🔥 Vol/MCap {vol_mcap:.1f}x — extremely rare signal")
+    elif vol_mcap >= 1.5: vm_score = 4; boosts.append(f"📊 Vol/MCap {vol_mcap:.1f}x — very active")
+    elif vol_mcap >= 0.5: vm_score = 2
+    else:                 vm_score = 0
+    score += vm_score; bd["vol_mcap_ratio"] = vm_score
+
+    # ── 10. Holder count (3 pts) ──────────────────────────────────────────────
+    hc = h.get("count", 0)
+    hc_score = 3 if hc > 100 else 2 if hc > 30 else 1 if hc > 10 else 0
+    score += hc_score; bd["holder_count"] = hc_score
+
+    # ── 10. Graduation bonus (2 pts) ─────────────────────────────────────────
     if info.get("graduated"):
-        score += 5; bd["graduation"] = 5
+        score += 2; bd["graduation"] = 2
         boosts.append("🎓 Graduated to PumpSwap")
     else:
         bd["graduation"] = 0
 
     # ── Hard disqualifiers ────────────────────────────────────────────────────
-    hard_fail = False
+    hard_fail    = False
     fail_reasons = []
-    if h["top1_pct"] > 50:
-        hard_fail = True; fail_reasons.append("top holder >50%")
-    if b["is_bundled"] and sm["count"] == 0:
-        hard_fail = True; fail_reasons.append("bundled + zero smart money")
-    if dev["is_serial"] and h["count"] < 30:
-        hard_fail = True; fail_reasons.append("serial rugger + <30 holders")
-    if not auth["mint_revoked"] and not auth["freeze_revoked"] and h["top1_pct"] > 30:
-        hard_fail = True; fail_reasons.append("active authorities + concentrated supply")
+
+    # Real whale concentration (LP excluded)
+    if real_top1 > 50:
+        hard_fail = True; fail_reasons.append(f"single wallet owns {real_top1}% (LP excluded) — instant rug")
+
+    # Bundled AND no smart money = fabricated demand, zero real interest
+    if b.get("is_bundled") and sm.get("count",0) == 0:
+        hard_fail = True; fail_reasons.append("bundled launch + zero smart money")
+
+    # Serial rugger deployer
+    if dev.get("is_serial") and hc < 20:
+        hard_fail = True; fail_reasons.append(f"serial launcher ({dev.get('launches',0)} launches) + only {hc} holders")
+
+    # Blacklisted deployer
     if info.get("deployer","") in blacklisted_devs:
-        hard_fail = True; fail_reasons.append("deployer is blacklisted rugger")
+        hard_fail = True; fail_reasons.append("deployer blacklisted")
+
+    # Active authorities + whale = almost certain rug setup
+    if not auth.get("mint_revoked") and not auth.get("freeze_revoked") and real_top1 > 40:
+        hard_fail = True; fail_reasons.append("both authorities active + whale concentration")
+
+    # Actively dumping
+    if mom.get("momentum") == "dumping":
+        hard_fail = True; fail_reasons.append("token is actively dumping right now")
+
+    # No price data on established token = suspicious (new tokens get a pass)
+    px = info.get("price", {})
+    if not px.get("found") and info.get("sigs_count", 0) > 80:
+        hard_fail = True; fail_reasons.append("no market data found for established token")
+
+    # Zero liquidity = untradeable
+    if liq.get("liquidity_usd",0) == 0 and not info.get("graduated"):
+        hard_fail = True; fail_reasons.append("zero liquidity — cannot trade")
 
     if hard_fail:
         warnings.append(f"❌ HARD FAIL: {', '.join(fail_reasons)}")
 
-    # Rug risk rating
-    if hard_fail or h["top1_pct"] > 40 or b["is_bundled"] or not auth["mint_revoked"]:
+    # ── Rug risk rating ───────────────────────────────────────────────────────
+    if hard_fail or real_top1 > 40 or b.get("is_bundled") or not auth.get("mint_revoked"):
         rug_risk = "high"
-    elif h["top1_pct"] > 20 or b["confidence"] > 20 or dev["risk"] == "medium":
+    elif real_top1 > 20 or b.get("confidence",0) > 30 or dev.get("risk") == "medium":
         rug_risk = "medium"
     else:
         rug_risk = "low"
 
+    final_score = 0 if hard_fail else min(99, score)
+
+    # Plain-English conviction tier
+    if hard_fail:
+        conviction = "❌ DO NOT BUY"
+    elif final_score >= 88:
+        conviction = "💎 VERY HIGH CONVICTION"
+    elif final_score >= 78:
+        conviction = "🟢 HIGH CONVICTION — strong buy"
+    elif final_score >= 68:
+        conviction = "🟡 MODERATE — proceed with caution"
+    elif final_score >= 55:
+        conviction = "🟠 WEAK — high risk"
+    else:
+        conviction = "🔴 AVOID"
+
     return {
-        "total":     0 if hard_fail else min(99, score),
-        "rug_risk":  rug_risk,
-        "hard_fail": hard_fail,
-        "warnings":  warnings,
-        "boosts":    boosts,
-        "breakdown": bd,
+        "total":      final_score,
+        "conviction": conviction,
+        "rug_risk":   rug_risk,
+        "hard_fail":  hard_fail,
+        "warnings":   warnings,
+        "boosts":     boosts,
+        "breakdown":  bd,
     }
+
 
 # ── Launchpad detector ─────────────────────────────────────────────────────────
 def detect_launchpad(keys: list) -> tuple:
@@ -557,6 +790,7 @@ def detect_launchpad(keys: list) -> tuple:
         if k in LAUNCHPADS:
             return LAUNCHPADS[k]
     return ("Unknown", "⚪")
+
 
 
 # ── Multi-wallet copy signal ───────────────────────────────────────────────────
@@ -1223,8 +1457,9 @@ def format_alert(mint: str, info: dict, result: dict) -> str:
     rug       = result["rug_risk"]
     re_emoji  = {"low":"🟢","medium":"🟡","high":"🔴"}.get(rug,"⚪")
     lp_name, lp_emoji = info.get("launchpad", ("Unknown","⚪"))
-    bar       = "█" * round(score/10) + "░" * (10 - round(score/10))
-    bd        = result["breakdown"]
+    bar        = "█" * round(score/10) + "░" * (10 - round(score/10))
+    conviction = result.get("conviction", "")
+    bd         = result["breakdown"]
     auth      = info.get("auth", {})
     liq       = info.get("liquidity", {})
     mom       = info.get("momentum", {})
@@ -1251,6 +1486,7 @@ def format_alert(mint: str, info: dict, result: dict) -> str:
         f"*Launchpad:* {lp_emoji} {lp_name}\n"
         f"*Token:* `{mint}`\n"
         f"*Score:* {score}/99  `{bar}`\n"
+        f"*Conviction:* {conviction}\n"
         f"{price_block}"
         f"*Breakdown:*\n"
         f"  🐋 Smart money:   {bd.get('smart_money',0)}/25\n"
@@ -1261,8 +1497,9 @@ def format_alert(mint: str, info: dict, result: dict) -> str:
         f"  💧 Liquidity:     {bd.get('liquidity',0)}/10\n"
         f"  🛡 Dev safety:    {bd.get('dev_safety',0)}/10\n"
         f"  📈 Momentum:      {bd.get('momentum',0)}/10\n"
-        f"  👥 Holders:       {bd.get('holder_count',0)}/5\n"
-        f"  🎓 Graduated:     {bd.get('graduation',0)}/5\n\n"
+        f"  📊 Vol/MCap:      {bd.get('vol_mcap_ratio',0)}/5\n"
+        f"  👥 Holders:       {bd.get('holder_count',0)}/3\n"
+        f"  🎓 Graduated:     {bd.get('graduation',0)}/2\n\n"
         f"*Signals:*\n{boosts_txt}\n\n"
         f"*Warnings:*\n{warnings_txt}\n\n"
         f"*Safety:*\n"
@@ -1507,18 +1744,7 @@ async def run_analysis(update: Update, mint: str):
             dev  = info.get("dev", {})
 
             # Verdict
-            if result["hard_fail"]:
-                verdict = "❌ DO NOT BUY — hard fail triggered"
-            elif score >= 85:
-                verdict = "🚀 Strong buy signal"
-            elif score >= 75:
-                verdict = "✅ Good — meets threshold"
-            elif score >= 60:
-                verdict = "⚠️ Moderate — trade carefully"
-            elif score >= 40:
-                verdict = "🔴 Weak — high risk"
-            else:
-                verdict = "💀 Avoid — very high risk"
+            verdict = result.get("conviction", "❌ DO NOT BUY" if result["hard_fail"] else "🔴 AVOID")
 
             boosts_txt   = "\n".join(result["boosts"])   or "None"
             warnings_txt = "\n".join(result["warnings"]) or "None"
@@ -1541,6 +1767,7 @@ async def run_analysis(update: Update, mint: str):
                 f"*CA:* `{mint}`\n"
                 f"*Launchpad:* {lp_emoji} {lp_name}\n"
                 f"*Score:* {score}/99  `{bar}`\n"
+        f"*Conviction:* {conviction}\n"
                 f"{price_block}"
                 f"*Verdict:* {verdict}\n\n"
                 f"*Score breakdown:*\n"
@@ -1552,8 +1779,9 @@ async def run_analysis(update: Update, mint: str):
                 f"  💧 Liquidity:     {bd.get('liquidity',0)}/10\n"
                 f"  🛡 Dev safety:    {bd.get('dev_safety',0)}/10\n"
                 f"  📈 Momentum:      {bd.get('momentum',0)}/10\n"
-                f"  👥 Holders:       {bd.get('holder_count',0)}/5\n"
-                f"  🎓 Graduated:     {bd.get('graduation',0)}/5\n\n"
+                f"  📊 Vol/MCap:      {bd.get('vol_mcap_ratio',0)}/5\n"
+                f"  👥 Holders:       {bd.get('holder_count',0)}/3\n"
+                f"  🎓 Graduated:     {bd.get('graduation',0)}/2\n\n"
                 f"*Safety checks:*\n"
                 f"  Mint authority:   {'✅ Revoked' if auth.get('mint_revoked') else '🚨 Still active'}\n"
                 f"  Freeze authority: {'✅ Revoked' if auth.get('freeze_revoked') else '🚨 Still active'}\n"
