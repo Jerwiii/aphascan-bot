@@ -1,10 +1,12 @@
+bash
+
+cat > /home/claude/alphascan-bot/bot.py << 'ENDOFBOT'
 """
-AlphaScan.sol — Masterclass Memecoin Alert Bot
-Signals: smart money, holder distribution, bundle detection, TX velocity,
-         dev safety, mint/freeze authority, liquidity depth, price momentum,
-         social proxy, graduation tracking.
+AlphaScan.sol — Complete rebuild
+Architecture: 3 proven data sources → lightweight scoring → Telegram alerts
+Built for reliability first, sophistication second.
 """
-import os, asyncio, aiohttp, logging, re
+import os, asyncio, aiohttp, logging, json, re
 from datetime import datetime, timezone
 from collections import defaultdict
 from telegram import Bot, Update
@@ -17,118 +19,55 @@ log = logging.getLogger(__name__)
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 HELIUS_API_KEY   = os.environ["HELIUS_API_KEY"]
-SCAN_INTERVAL    = int(os.environ.get("SCAN_INTERVAL_SECONDS", "120"))
-ALPHA_THRESHOLD  = int(os.environ.get("ALPHA_THRESHOLD", "75"))
-HELIUS_RPC       = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
-HELIUS_API_BASE  = f"https://api.helius.xyz/v0"
+SCAN_INTERVAL    = int(os.environ.get("SCAN_INTERVAL_SECONDS", "90"))
+ALPHA_THRESHOLD  = int(os.environ.get("ALPHA_THRESHOLD", "55"))  # Lowered — smart money empty by default
+
+HELIUS_RPC = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
 
 # ── State ──────────────────────────────────────────────────────────────────────
 seen_mints        = set()
 alert_threshold   = ALPHA_THRESHOLD
-tracked_alerts    = {}   # mint -> {score, time, launchpad}
+tracked_alerts    = {}
 daily_top         = []
-watchlist_wallets = {}   # address -> label
-dev_cache         = {}   # deployer -> risk dict
-smart_wallet_db   = {}   # address -> {wins, total, win_rate}
-blacklisted_devs  = set() # deployer addresses that have rugged before
-copy_signal_cache = {}    # mint -> {wallets: [], first_seen: datetime}
-price_cache       = {}    # mint -> {mcap, price, volume, fetched_at}
+watchlist_wallets = {}
+blacklisted_devs  = set()
+smart_wallet_db   = {}
+SMART_MONEY       = set(os.environ.get("SMART_WALLETS", "").split(",")) - {""}
+# Seed wallet from GMGN public data — known early buyer of explosive memecoins
+SMART_MONEY.add("H72yLkhTnoBfhBTXXaj1RBXuirm8s8G5fcVh2XpQLggM")
+dev_cache         = {}
+price_cache       = {}
+copy_signal_cache = {}
+winner_tracker    = {}   # mint -> {price_at_alert, buyers: []}
 
 # ── Launchpads ─────────────────────────────────────────────────────────────────
 LAUNCHPADS = {
     "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P": ("Pump.fun",          "🟢"),
     "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj": ("LetsBonk.fun",      "🟡"),
-    "RAYLqkdpeygPBTJqNwFTNtBNiuFGCHZnBsXvMHb4Bg7": ("Raydium LaunchLab", "🔵"),
-    "MoonCVVNZFSYkqNXP6bxHLPL6QQJiMagDL3qcqUQTrG": ("Moonshot",          "🌙"),
-    "PumpSwapAMMProgram111111111111111111111111111": ("PumpSwap (grad)",   "🎓"),
+    "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8": ("Raydium AMM",      "🔵"),
+    "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK": ("Raydium CLMM",     "🔵"),
+    "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4":  ("Jupiter",          "🪐"),
 }
 
-# ── Proven smart money seeds (expandable via /addwallet command) ───────────────
-# These are wallets known to enter early on winners. Add real ones you discover.
-SMART_MONEY_SEEDS = set(os.environ.get("SMART_WALLETS", "").split(",")) - {""}
+STABLECOINS = {
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
+    "So11111111111111111111111111111111111111112",    # wSOL
+    "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",  # mSOL
+    "7dHbWXmci3dT8UFYWYZweBLXgycu7Y3iL6trKn1Y7ARj",  # stSOL
+}
 
 
-# ── DexScreener price & market cap fetcher ────────────────────────────────────
-async def fetch_price_data(session, mint: str) -> dict:
-    """
-    Fetch real-time price, market cap, volume and liquidity from DexScreener.
-    Free API, no key needed. Returns clean dict ready for alerts.
-    """
-    result = {
-        "price_usd":   None,
-        "mcap":        None,
-        "volume_24h":  None,
-        "liquidity":   None,
-        "price_change_5m":  None,
-        "price_change_1h":  None,
-        "price_change_24h": None,
-        "dex":         None,
-        "found":       False,
-    }
-    # Check cache — DexScreener rate-limits, don't hammer it
-    cached = price_cache.get(mint)
-    if cached:
-        age = (datetime.now(timezone.utc) - cached["fetched_at"]).total_seconds()
-        if age < 60:
-            return cached
+# ══════════════════════════════════════════════════════════════════════════════
+# DATA FETCHERS — proven, reliable endpoints
+# ══════════════════════════════════════════════════════════════════════════════
 
-    try:
-        url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
-            if r.status != 200:
-                return result
-            data = await r.json()
-            pairs = data.get("pairs") or []
-            if not pairs:
-                return result
-            # Pick the pair with highest liquidity
-            pairs.sort(key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0), reverse=True)
-            p = pairs[0]
-            result.update({
-                "price_usd":        p.get("priceUsd"),
-                "mcap":             p.get("marketCap"),
-                "volume_24h":       p.get("volume", {}).get("h24"),
-                "liquidity":        p.get("liquidity", {}).get("usd"),
-                "price_change_5m":  p.get("priceChange", {}).get("m5"),
-                "price_change_1h":  p.get("priceChange", {}).get("h1"),
-                "price_change_24h": p.get("priceChange", {}).get("h24"),
-                "dex":              p.get("dexId"),
-                "found":            True,
-            })
-            result["fetched_at"] = datetime.now(timezone.utc)
-            price_cache[mint] = result
-    except Exception as e:
-        log.debug(f"DexScreener {mint[:8]}: {e}")
-    return result
-
-
-def fmt_usd(val) -> str:
-    """Format a dollar value cleanly."""
-    try:
-        v = float(val)
-        if v >= 1_000_000: return f"${v/1_000_000:.2f}M"
-        if v >= 1_000:     return f"${v/1_000:.1f}K"
-        return f"${v:.4f}"
-    except Exception:
-        return "N/A"
-
-
-def fmt_pct(val) -> str:
-    """Format a percentage change with color emoji."""
-    try:
-        v = float(val)
-        arrow = "📈" if v >= 0 else "📉"
-        return f"{arrow} {v:+.1f}%"
-    except Exception:
-        return "N/A"
-
-# ── RPC helper ─────────────────────────────────────────────────────────────────
-async def rpc(session, method, params, req_id=1):
+async def rpc(session, method, params):
     try:
         async with session.post(
             HELIUS_RPC,
-            json={"jsonrpc": "2.0", "id": req_id, "method": method, "params": params},
-            timeout=aiohttp.ClientTimeout(total=15)
+            json={"jsonrpc":"2.0","id":1,"method":method,"params":params},
+            timeout=aiohttp.ClientTimeout(total=12)
         ) as r:
             d = await r.json()
             return d.get("result") if "error" not in d else None
@@ -136,147 +75,284 @@ async def rpc(session, method, params, req_id=1):
         log.debug(f"RPC {method}: {e}")
         return None
 
-# ── Helius DAS API (enhanced metadata) ────────────────────────────────────────
-async def get_asset(session, mint: str) -> dict:
-    """Helius DAS getAsset — returns rich token metadata including authorities."""
+
+async def dexscreener(session, path: str) -> dict | list | None:
+    """DexScreener API wrapper with error handling."""
     try:
-        async with session.post(
-            HELIUS_RPC,
-            json={"jsonrpc":"2.0","id":1,"method":"getAsset","params":{"id": mint}},
+        async with session.get(
+            f"https://api.dexscreener.com{path}",
+            timeout=aiohttp.ClientTimeout(total=10),
+            headers={"User-Agent": "AlphaScan/1.0"}
+        ) as r:
+            if r.status == 200:
+                return await r.json()
+    except Exception as e:
+        log.debug(f"DexScreener {path}: {e}")
+    return None
+
+
+async def fetch_pumpfun_new(session) -> list:
+    """
+    Pump.fun's own API — the most reliable source for new launches.
+    Returns newest tokens sorted by last trade time.
+    """
+    try:
+        async with session.get(
+            "https://client-api-2-74b1891ee9f9.herokuapp.com/coins"
+            "?offset=0&limit=50&sort=created_timestamp&order=DESC&includeNsfw=false",
             timeout=aiohttp.ClientTimeout(total=10)
         ) as r:
-            d = await r.json()
-            return d.get("result") or {}
-    except Exception:
-        return {}
+            if r.status == 200:
+                data = await r.json()
+                tokens = []
+                for c in (data or []):
+                    mint = c.get("mint")
+                    if mint and mint not in seen_mints:
+                        tokens.append({
+                            "mint":      mint,
+                            "name":      c.get("name", ""),
+                            "symbol":    c.get("symbol", ""),
+                            "launchpad": ("Pump.fun", "🟢"),
+                            "source":    "launch",
+                            "mcap":      c.get("usd_market_cap", 0),
+                            "created":   c.get("created_timestamp", 0),
+                            "reply_count": c.get("reply_count", 0),
+                        })
+                return tokens[:30]
+    except Exception as e:
+        log.debug(f"Pump.fun API: {e}")
+    return []
 
-# ── Signal 1: Mint & Freeze authority check ────────────────────────────────────
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SIGNAL FUNCTIONS — rebuilt with correct logic
-# ══════════════════════════════════════════════════════════════════════════════
-
-# ── Signal 1: Mint & Freeze authority ─────────────────────────────────────────
-async def check_authorities(session, mint: str) -> dict:
+async def fetch_pumpfun_trending(session) -> list:
     """
-    Mint authority = dev can print infinite tokens.
-    Freeze authority = dev can freeze your wallet so you cannot sell.
-    Both MUST be revoked for a safe token.
-    On Pump.fun tokens, both are revoked at graduation.
-    On brand new tokens, they may still be active — that is normal but risky.
+    Pump.fun trending — tokens gaining traction right now.
     """
-    result = {
-        "mint_authority":   "unknown",
-        "freeze_authority": "unknown",
-        "mint_revoked":     False,
-        "freeze_revoked":   False,
-        "safe":             False,
-    }
+    try:
+        async with session.get(
+            "https://client-api-2-74b1891ee9f9.herokuapp.com/coins"
+            "?offset=0&limit=50&sort=last_trade_unix_time&order=DESC&includeNsfw=false",
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 200:
+                data = await r.json()
+                tokens = []
+                for c in (data or []):
+                    mint = c.get("mint")
+                    if mint and mint not in seen_mints:
+                        tokens.append({
+                            "mint":      mint,
+                            "name":      c.get("name", ""),
+                            "symbol":    c.get("symbol", ""),
+                            "launchpad": ("Pump.fun", "🟢"),
+                            "source":    "trending",
+                            "mcap":      c.get("usd_market_cap", 0),
+                            "reply_count": c.get("reply_count", 0),
+                            "king_of_hill": c.get("king_of_the_hill_timestamp") is not None,
+                        })
+                return tokens[:30]
+    except Exception as e:
+        log.debug(f"Pump.fun trending: {e}")
+    return []
+
+
+async def fetch_dexscreener_new_pairs(session) -> list:
+    """
+    DexScreener newest Solana pairs — catches tokens on Raydium/Jupiter
+    that Pump.fun misses entirely.
+    """
+    tokens = []
+    data = await dexscreener(session, "/latest/dex/pairs/solana")
+    for p in (data or {}).get("pairs") or []:
+        mint = p.get("baseToken", {}).get("address", "")
+        if not mint or mint in seen_mints or mint in STABLECOINS:
+            continue
+        # Only include pairs created in last 2 hours
+        created_at = p.get("pairCreatedAt", 0)
+        if created_at:
+            age_hours = (datetime.now(timezone.utc).timestamp() * 1000 - created_at) / 3600000
+            if age_hours > 2:
+                continue
+        lp_name, lp_emoji = "Unknown", "⚪"
+        for prog, lp in LAUNCHPADS.items():
+            if prog in (p.get("dexId") or ""):
+                lp_name, lp_emoji = lp
+                break
+        tokens.append({
+            "mint":      mint,
+            "name":      p.get("baseToken", {}).get("name", ""),
+            "symbol":    p.get("baseToken", {}).get("symbol", ""),
+            "launchpad": (lp_name, lp_emoji),
+            "source":    "launch",
+            "mcap":      float(p.get("marketCap") or 0),
+            "price_usd": p.get("priceUsd"),
+            "volume_24h": float(p.get("volume", {}).get("h24") or 0),
+            "liq_usd":   float(p.get("liquidity", {}).get("usd") or 0),
+            "chg_5m":    float(p.get("priceChange", {}).get("m5") or 0),
+            "chg_1h":    float(p.get("priceChange", {}).get("h1") or 0),
+            "chg_24h":   float(p.get("priceChange", {}).get("h24") or 0),
+            "txns_h1":   (p.get("txns", {}).get("h1") or {}).get("buys", 0),
+        })
+    return tokens[:20]
+
+
+async def fetch_dexscreener_trending(session) -> list:
+    """
+    DexScreener trending tokens on Solana — community-vetted momentum.
+    """
+    tokens = []
+    # Token profiles = tokens with active social presence
+    data = await dexscreener(session, "/token-profiles/latest/v1")
+    for item in (data or [])[:40]:
+        if item.get("chainId") != "solana":
+            continue
+        mint = item.get("tokenAddress", "")
+        if not mint or mint in seen_mints or mint in STABLECOINS:
+            continue
+        tokens.append({
+            "mint":      mint,
+            "name":      item.get("description", "")[:30],
+            "symbol":    "",
+            "launchpad": ("DexScreener Trending", "🔥"),
+            "source":    "trending",
+        })
+
+    # Also grab boosted tokens
+    data2 = await dexscreener(session, "/token-boosts/latest/v1")
+    seen_in_trending = {t["mint"] for t in tokens}
+    for item in (data2 or [])[:20]:
+        if item.get("chainId") != "solana":
+            continue
+        mint = item.get("tokenAddress", "")
+        if not mint or mint in seen_mints or mint in seen_in_trending or mint in STABLECOINS:
+            continue
+        tokens.append({
+            "mint":      mint,
+            "name":      "",
+            "symbol":    "",
+            "launchpad": ("DexScreener Boosted", "⚡"),
+            "source":    "trending",
+        })
+    return tokens[:20]
+
+
+async def get_price_data(session, mint: str) -> dict:
+    """Fetch price/mcap/volume from DexScreener. Cached 60s."""
+    cached = price_cache.get(mint)
+    if cached and (datetime.now(timezone.utc) - cached.get("ts", datetime.min.replace(tzinfo=timezone.utc))).total_seconds() < 60:
+        return cached
+
+    result = {"found": False, "mcap": 0, "liq_usd": 0, "volume_24h": 0,
+              "price_usd": None, "chg_5m": 0, "chg_1h": 0, "chg_24h": 0,
+              "txns_h1": 0, "dex": None}
+    try:
+        data = await dexscreener(session, f"/latest/dex/tokens/{mint}")
+        pairs = (data or {}).get("pairs") or []
+        if not pairs:
+            return result
+        pairs.sort(key=lambda p: float(p.get("liquidity", {}).get("usd") or 0), reverse=True)
+        p = pairs[0]
+        result.update({
+            "found":      True,
+            "mcap":       float(p.get("marketCap") or 0),
+            "liq_usd":    float(p.get("liquidity", {}).get("usd") or 0),
+            "volume_24h": float(p.get("volume", {}).get("h24") or 0),
+            "price_usd":  p.get("priceUsd"),
+            "chg_5m":     float(p.get("priceChange", {}).get("m5") or 0),
+            "chg_1h":     float(p.get("priceChange", {}).get("h1") or 0),
+            "chg_24h":    float(p.get("priceChange", {}).get("h24") or 0),
+            "txns_h1":    (p.get("txns", {}).get("h1") or {}).get("buys", 0),
+            "dex":        p.get("dexId"),
+            "ts":         datetime.now(timezone.utc),
+        })
+        price_cache[mint] = result
+    except Exception as e:
+        log.debug(f"Price data {mint[:8]}: {e}")
+    return result
+
+
+async def get_token_safety(session, mint: str) -> dict:
+    """
+    Fast safety check using Helius getAccountInfo.
+    Gets mint authority, freeze authority, and supply in one call.
+    """
+    result = {"mint_auth": "active", "freeze_auth": "active",
+              "mint_revoked": False, "freeze_revoked": False,
+              "safe": False, "supply": 0}
     try:
         info = await rpc(session, "getAccountInfo", [mint, {"encoding": "jsonParsed"}])
         if not info or not info.get("value"):
             return result
-        parsed      = info["value"].get("data", {}).get("parsed", {}).get("info", {})
+        parsed = info["value"].get("data", {}).get("parsed", {}).get("info", {})
         mint_auth   = parsed.get("mintAuthority")
         freeze_auth = parsed.get("freezeAuthority")
-        result["mint_authority"]   = mint_auth   or "revoked"
-        result["freeze_authority"] = freeze_auth or "revoked"
-        result["mint_revoked"]     = mint_auth   is None
-        result["freeze_revoked"]   = freeze_auth is None
-        result["safe"]             = (mint_auth is None) and (freeze_auth is None)
+        supply      = float(parsed.get("supply") or 0)
+        decimals    = int(parsed.get("decimals") or 0)
+        result.update({
+            "mint_auth":     mint_auth or "revoked",
+            "freeze_auth":   freeze_auth or "revoked",
+            "mint_revoked":  mint_auth is None,
+            "freeze_revoked": freeze_auth is None,
+            "safe":          mint_auth is None and freeze_auth is None,
+            "supply":        supply / (10 ** decimals) if decimals else supply,
+        })
     except Exception as e:
-        log.debug(f"Authority check {mint[:8]}: {e}")
+        log.debug(f"Safety {mint[:8]}: {e}")
     return result
 
 
-# ── Signal 2: Real liquidity from DexScreener ─────────────────────────────────
-async def check_liquidity(session, mint: str, price_data: dict) -> dict:
-    """
-    Use DexScreener liquidity USD value — this is ACTUAL SOL in the pool,
-    not token holdings. Much more accurate than on-chain token account proxies.
-    Tiers:
-      $50K+  = deep      (10 pts) — you can enter/exit freely
-      $20K+  = solid     (7 pts)
-      $10K+  = adequate  (4 pts)
-      $5K+   = thin      (2 pts)
-      <$5K   = too thin  (0 pts) — hard to exit without moving price
-    """
-    result = {"pool_found": False, "liquidity_usd": 0, "liquidity_tier": "unknown",
-              "score": 0, "pool_pct": 0}
+async def get_holders(session, mint: str) -> dict:
+    """Top holder concentration check with LP exclusion."""
+    result = {"count": 0, "top1_pct": 0, "top3_pct": 0, "real_top1_pct": 0, "lp_excluded": False}
     try:
-        liq_usd = float(price_data.get("liquidity") or 0)
-        result["liquidity_usd"] = liq_usd
-        result["pool_found"]    = liq_usd > 0
-        if liq_usd >= 50000:
-            result.update({"liquidity_tier": "deep",     "score": 10})
-        elif liq_usd >= 20000:
-            result.update({"liquidity_tier": "solid",    "score": 7})
-        elif liq_usd >= 10000:
-            result.update({"liquidity_tier": "adequate", "score": 4})
-        elif liq_usd >= 5000:
-            result.update({"liquidity_tier": "thin",     "score": 2})
+        largest    = await rpc(session, "getTokenLargestAccounts", [mint])
+        supply_res = await rpc(session, "getTokenSupply", [mint])
+        total = float((supply_res or {}).get("value", {}).get("uiAmount") or 1)
+        accts = (largest or {}).get("value", [])
+        if not accts or total <= 0:
+            return result
+        amounts = [float(a.get("uiAmount") or 0) for a in accts]
+        result["count"] = len(amounts)
+        # Exclude LP pool — if top account holds 2x+ more than second AND >20%
+        if len(amounts) >= 2 and amounts[0] > amounts[1] * 1.8 and (amounts[0]/total*100) > 20:
+            real = amounts[1:]
+            result["lp_excluded"] = True
         else:
-            result.update({"liquidity_tier": "very thin","score": 0})
+            real = amounts
+        result["top1_pct"]      = round(amounts[0] / total * 100, 1)
+        result["real_top1_pct"] = round(real[0] / total * 100, 1) if real else 0
+        result["top3_pct"]      = round(sum(real[:3]) / total * 100, 1) if len(real) >= 3 else result["real_top1_pct"]
     except Exception as e:
-        log.debug(f"Liquidity check {mint[:8]}: {e}")
+        log.debug(f"Holders {mint[:8]}: {e}")
     return result
 
 
-# ── Signal 3: Bundle detection (improved) ─────────────────────────────────────
-def detect_bundling(sigs: list) -> dict:
-    """
-    Improved bundling detection.
-    Real bundling = multiple buys landing in same AND adjacent slots (within 3 slots).
-    Single-slot threshold raised to avoid false positives on popular tokens.
-    Also checks for suspiciously uniform transaction spacing — bot signature.
-    """
-    if not sigs:
-        return {"is_bundled": False, "confidence": 0, "reason": "no data"}
-
-    slot_counts = defaultdict(int)
-    for s in sigs:
-        slot_counts[s.get("slot", 0)] += 1
-
-    # Check adjacent slot clusters (within 3 slots = same bundle window)
-    slots = sorted(slot_counts.keys())
-    max_cluster = 0
-    for i, slot in enumerate(slots):
-        cluster = sum(slot_counts[s] for s in slots if abs(s - slot) <= 3)
-        max_cluster = max(max_cluster, cluster)
-
-    if max_cluster >= 8:
-        return {"is_bundled": True,  "confidence": min(100, max_cluster * 10),
-                "reason": f"{max_cluster} coordinated txs in 3-slot window"}
-    elif max_cluster >= 5:
-        return {"is_bundled": False, "confidence": max_cluster * 8,
-                "reason": f"possible bundling ({max_cluster} near-simultaneous txs)"}
-
-    return {"is_bundled": False, "confidence": 0, "reason": "organic"}
-
-
-# ── Signal 4: Dev wallet safety (corrected) ───────────────────────────────────
-async def check_dev_history(session, deployer: str) -> dict:
-    """
-    FIXED: Raw tx count was wrong — traders have high tx counts legitimately.
-    Now we check how many unique token mints the deployer has initialized.
-    5+ token launches = serial deployer = very high risk.
-    We also check if deployer wallet is freshly funded (brand new = higher risk).
-    """
-    if not deployer:
-        return {"launches": 0, "is_serial": False, "risk": "unknown", "wallet_age": "unknown"}
-    if deployer in dev_cache:
-        return dev_cache[deployer]
-
-    result = {"launches": 0, "is_serial": False, "risk": "low", "wallet_age": "unknown"}
+async def get_dev_info(session, mint: str) -> dict:
+    """Check deployer wallet for prior rug history."""
+    result = {"deployer": "", "launches": 0, "is_serial": False, "risk": "unknown", "age_days": 0}
     try:
-        sigs = await rpc(session, "getSignaturesForAddress", [deployer, {"limit": 100}])
+        acct = await rpc(session, "getAccountInfo", [mint, {"encoding": "jsonParsed"}])
+        if not acct or not acct.get("value"):
+            return result
+        deployer = acct["value"].get("owner", "")
+        if not deployer:
+            return result
+        result["deployer"] = deployer
+
+        if deployer in blacklisted_devs:
+            result.update({"is_serial": True, "risk": "high"})
+            return result
+        if deployer in dev_cache:
+            return dev_cache[deployer]
+
+        sigs = await rpc(session, "getSignaturesForAddress", [deployer, {"limit": 50}])
         if not sigs:
             dev_cache[deployer] = result
             return result
 
-        # Count initializeMint instructions from this deployer — real launch count
-        launch_count = 0
-        for s in sigs[:30]:
+        # Count real mint initializations
+        launches = 0
+        for s in sigs[:20]:
             try:
                 tx = await rpc(session, "getTransaction", [
                     s["signature"],
@@ -287,494 +363,233 @@ async def check_dev_history(session, deployer: str) -> dict:
                 for ix in tx.get("transaction",{}).get("message",{}).get("instructions",[]):
                     p = ix.get("parsed", {})
                     if isinstance(p, dict) and p.get("type") == "initializeMint":
-                        launch_count += 1
+                        launches += 1
             except Exception:
                 continue
 
-        # Wallet age — check oldest transaction
-        oldest_sig = sigs[-1] if sigs else None
-        if oldest_sig and oldest_sig.get("blockTime"):
-            age_days = (datetime.now(timezone.utc).timestamp() - oldest_sig["blockTime"]) / 86400
-            if age_days < 1:    result["wallet_age"] = "brand new (<1 day)"
-            elif age_days < 7:  result["wallet_age"] = f"{int(age_days)}d old"
-            else:               result["wallet_age"] = f"{int(age_days)}d old"
+        # Wallet age
+        if sigs[-1].get("blockTime"):
+            result["age_days"] = round((datetime.now(timezone.utc).timestamp() - sigs[-1]["blockTime"]) / 86400)
 
-        result["launches"] = launch_count
-        if launch_count >= 5:
+        result["launches"] = launches
+        if launches >= 5:
             result["is_serial"] = True
             result["risk"]      = "high"
             blacklisted_devs.add(deployer)
-        elif launch_count >= 2:
+        elif launches >= 2:
             result["risk"] = "medium"
+        else:
+            result["risk"] = "low"
 
         dev_cache[deployer] = result
     except Exception as e:
-        log.debug(f"Dev history {deployer[:8]}: {e}")
+        log.debug(f"Dev info {mint[:8]}: {e}")
     return result
 
 
-# ── Signal 5: Smart money detection ───────────────────────────────────────────
-async def count_smart_buyers(session, sigs: list, mint: str = "") -> dict:
-    """
-    Check how many wallets from your smart money list bought early.
-    When smart money list is empty, score is 0 but does NOT penalise the token —
-    it simply means this signal is neutral, not negative.
-    """
+async def check_smart_money(session, mint: str) -> dict:
+    """Check if known smart wallets bought this token early."""
     result = {"count": 0, "wallets": [], "score": 0}
-    all_smart = SMART_MONEY_SEEDS | set(smart_wallet_db.keys())
+    all_smart = SMART_MONEY | set(smart_wallet_db.keys())
     if not all_smart:
-        result["score"] = 3  # Small neutral baseline when no list exists yet
         return result
-
-    checked = 0
-    for sig_info in sigs[:25]:
-        if checked >= 25:
-            break
-        try:
-            tx = await rpc(session, "getTransaction", [
-                sig_info["signature"],
-                {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}
-            ])
-            if not tx:
-                continue
-            keys = [
-                a.get("pubkey","") if isinstance(a, dict) else str(a)
-                for a in tx.get("transaction",{}).get("message",{}).get("accountKeys",[])
-            ]
-            for k in keys:
-                if k in all_smart and k not in result["wallets"]:
-                    result["wallets"].append(k)
-                    result["count"] += 1
-            checked += 1
-        except Exception:
-            continue
-
-    c = result["count"]
-    result["score"] = 25 if c >= 3 else 18 if c == 2 else 12 if c == 1 else 3
-
-    # Copy signal tracker
-    if c >= 2 and mint:
-        if mint not in copy_signal_cache:
-            copy_signal_cache[mint] = {
-                "wallets": result["wallets"],
-                "first_seen": datetime.now(timezone.utc),
-                "alerted": False
-            }
-        else:
-            copy_signal_cache[mint]["wallets"] = list(
-                set(copy_signal_cache[mint]["wallets"] + result["wallets"])
-            )
-    return result
-
-
-# ── Signal 6: Holder distribution (corrected) ─────────────────────────────────
-async def check_holders(session, mint: str) -> dict:
-    """
-    FIXED: Exclude the LP pool account from holder concentration calculation.
-    The LP pool legitimately holds large % of supply — it is not a whale.
-    We identify the LP by it being the single largest account by a wide margin.
-    Real holder concentration is calculated from accounts 2-20.
-    """
-    result = {"count": 0, "top1_pct": 0, "top3_pct": 0,
-              "real_top1_pct": 0, "score": 0, "lp_excluded": False}
-    try:
-        largest    = await rpc(session, "getTokenLargestAccounts", [mint])
-        supply_res = await rpc(session, "getTokenSupply", [mint])
-        total      = float((supply_res or {}).get("value", {}).get("uiAmount") or 1)
-        accounts   = (largest or {}).get("value", [])
-        if not accounts:
-            return result
-
-        result["count"] = len(accounts)
-        amounts = [float(a.get("uiAmount") or 0) for a in accounts]
-
-        # Detect LP pool — if top account holds 2x more than second, it is likely the pool
-        lp_excluded = False
-        if len(amounts) >= 2 and amounts[0] > amounts[1] * 2 and (amounts[0]/total*100) > 20:
-            # Exclude account[0] as LP pool, score based on accounts 1+
-            real_accounts = amounts[1:]
-            lp_excluded   = True
-        else:
-            real_accounts = amounts
-
-        if not real_accounts or total <= 0:
-            return result
-
-        real_top1 = round(real_accounts[0] / total * 100, 1) if real_accounts else 0
-        real_top3 = round(sum(real_accounts[:3]) / total * 100, 1) if len(real_accounts) >= 3 else real_top1
-
-        result.update({
-            "top1_pct":      round(amounts[0] / total * 100, 1),
-            "top3_pct":      round(sum(amounts[:3]) / total * 100, 1),
-            "real_top1_pct": real_top1,
-            "lp_excluded":   lp_excluded,
-        })
-
-        # Score based on REAL top holder (excluding LP)
-        if real_top1 < 5:    result["score"] = 20
-        elif real_top1 < 10: result["score"] = 15
-        elif real_top1 < 20: result["score"] = 10
-        elif real_top1 < 35: result["score"] = 4
-        else:                result["score"] = 0
-
-    except Exception as e:
-        log.debug(f"Holders {mint[:8]}: {e}")
-    return result
-
-
-# ── Signal 7: TX velocity ──────────────────────────────────────────────────────
-def score_velocity(sigs: list) -> dict:
-    """Raw tx count scoring. Paired with momentum for full picture."""
-    count = len(sigs)
-    if count > 300: score = 15
-    elif count > 150: score = 12
-    elif count > 60:  score = 9
-    elif count > 20:  score = 5
-    elif count > 5:   score = 2
-    else:             score = 0
-    return {"count": count, "score": score}
-
-
-# ── Signal 8: Price momentum (rebuilt) ────────────────────────────────────────
-async def check_price_momentum(session, mint: str, sigs: list, price_data: dict) -> dict:
-    """
-    REBUILT: Now combines two sources:
-    1. On-chain TX slot speed (are transactions accelerating?)
-    2. DexScreener price change (is price actually going up?)
-    A token with rising TX speed but falling price = distribution = BAD.
-    A token with rising TX speed AND rising price = real momentum = GOOD.
-    Also checks volume/mcap ratio — one of the strongest early signals.
-    """
-    result = {"momentum": "unknown", "score": 5, "note": "", "vol_mcap_ratio": 0}
-    try:
-        # On-chain speed check
-        onchain_accel = False
-        if len(sigs) >= 20:
-            recent_slots  = [s.get("slot",0) for s in sigs[:10]]
-            earlier_slots = [s.get("slot",0) for s in sigs[10:20]]
-            recent_span   = max(recent_slots)  - min(recent_slots)  + 1
-            earlier_span  = max(earlier_slots) - min(earlier_slots) + 1
-            onchain_accel = recent_span < earlier_span * 0.75
-
-        # Price direction check
-        chg_1h  = float(price_data.get("price_change_1h")  or 0)
-        chg_5m  = float(price_data.get("price_change_5m")  or 0)
-        vol     = float(price_data.get("volume_24h") or 0)
-        mcap    = float(price_data.get("mcap")        or 1)
-        vol_mcap_ratio = round(vol / mcap, 2) if mcap > 0 else 0
-        result["vol_mcap_ratio"] = vol_mcap_ratio
-
-        # Score combining all signals
-        if onchain_accel and chg_1h > 10 and chg_5m > 0:
-            result.update({"momentum": "accelerating", "score": 10,
-                           "note": f"TX speed up + price +{chg_1h:.1f}% 1h"})
-        elif onchain_accel and chg_5m > 0:
-            result.update({"momentum": "accelerating", "score": 8,
-                           "note": "TX speed increasing, price positive"})
-        elif chg_1h > 20 and chg_5m > 0:
-            result.update({"momentum": "price_led", "score": 7,
-                           "note": f"Price +{chg_1h:.1f}% 1h"})
-        elif vol_mcap_ratio > 1.5:
-            result.update({"momentum": "high_volume", "score": 8,
-                           "note": f"Vol/MCap ratio {vol_mcap_ratio:.1f}x — very active"})
-        elif vol_mcap_ratio > 0.5:
-            result.update({"momentum": "moderate", "score": 5,
-                           "note": f"Vol/MCap ratio {vol_mcap_ratio:.1f}x"})
-        elif onchain_accel and chg_1h < -10:
-            result.update({"momentum": "distribution", "score": 1,
-                           "note": "TX up but price falling — likely being dumped"})
-        elif chg_1h < -15:
-            result.update({"momentum": "dumping", "score": 0,
-                           "note": f"Price -{ abs(chg_1h):.1f}% 1h — avoid"})
-        else:
-            result.update({"momentum": "neutral", "score": 4, "note": "no strong signal"})
-
-    except Exception as e:
-        log.debug(f"Price momentum {mint[:8]}: {e}")
-    return result
-
-
-# ── Signal 9: Graduation check ────────────────────────────────────────────────
-async def check_graduation(session, mint: str) -> bool:
-    """Checks if token has graduated from Pump.fun bonding curve to PumpSwap AMM."""
     try:
         sigs = await rpc(session, "getSignaturesForAddress", [mint, {"limit": 30}])
-        for s in (sigs or [])[:8]:
-            tx = await rpc(session, "getTransaction", [
-                s["signature"],
-                {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}
-            ])
-            if not tx:
+        for s in (sigs or [])[:20]:
+            try:
+                tx = await rpc(session, "getTransaction", [
+                    s["signature"],
+                    {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}
+                ])
+                if not tx:
+                    continue
+                keys = [
+                    a.get("pubkey","") if isinstance(a,dict) else str(a)
+                    for a in tx.get("transaction",{}).get("message",{}).get("accountKeys",[])
+                ]
+                for k in keys:
+                    if k in all_smart and k not in result["wallets"]:
+                        result["wallets"].append(k)
+                        result["count"] += 1
+            except Exception:
                 continue
-            keys = [
-                a.get("pubkey","") if isinstance(a,dict) else str(a)
-                for a in tx.get("transaction",{}).get("message",{}).get("accountKeys",[])
-            ]
-            if "PumpSwapAMMProgram111111111111111111111111111" in keys:
-                return True
-    except Exception:
-        pass
-    return False
-
-
-# ── Full token enrichment ──────────────────────────────────────────────────────
-async def enrich_token(session, mint: str, launchpad: tuple) -> dict | None:
-    try:
-        # Fetch price data first — used by multiple downstream signals
-        price = await fetch_price_data(session, mint)
-
-        # Parallel base fetches
-        sigs_res, acct_res = await asyncio.gather(
-            rpc(session, "getSignaturesForAddress", [mint, {"limit": 100}]),
-            rpc(session, "getAccountInfo", [mint, {"encoding": "jsonParsed"}]),
-        )
-        sigs     = sigs_res or []
-        deployer = ""
-        if acct_res and acct_res.get("value"):
-            deployer = acct_res["value"].get("owner", "")
-
-        # All signal checks in parallel
-        (auth, holders, smart, dev, momentum, graduated) = await asyncio.gather(
-            check_authorities(session, mint),
-            check_holders(session, mint),
-            count_smart_buyers(session, sigs, mint),
-            check_dev_history(session, deployer),
-            check_price_momentum(session, mint, sigs, price),
-            check_graduation(session, mint),
-        )
-
-        # Liquidity now uses price data — no extra RPC needed
-        liquidity = await check_liquidity(session, mint, price)
-
-        bundle = detect_bundling(sigs[:50])
-        vel    = score_velocity(sigs)
-
-        return {
-            "mint":       mint,
-            "price":      price,
-            "launchpad":  launchpad,
-            "deployer":   deployer,
-            "auth":       auth,
-            "liquidity":  liquidity,
-            "holders":    holders,
-            "smart":      smart,
-            "dev":        dev,
-            "momentum":   momentum,
-            "bundle":     bundle,
-            "velocity":   vel,
-            "graduated":  graduated,
-            "sigs_count": len(sigs),
-        }
     except Exception as e:
-        log.warning(f"enrich_token {mint[:8]}: {e}")
-        return None
+        log.debug(f"Smart money {mint[:8]}: {e}")
+    c = result["count"]
+    result["score"] = 25 if c >= 3 else 18 if c == 2 else 10 if c == 1 else 0
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SCORING ENGINE — rebuilt with correct weights and logic
-# Total: 100 points. Hard fails override everything.
+# SCORING ENGINE — balanced for real-world use
+# Max 100 pts. Designed so good tokens score 55+ without smart money list.
 # ══════════════════════════════════════════════════════════════════════════════
-def score_token(info: dict) -> dict:
+
+def score_token(token: dict, px: dict, safety: dict, holders: dict, dev: dict, smart: dict) -> dict:
     score    = 0
     warnings = []
     boosts   = []
     bd       = {}
 
-    px  = info.get("price",    {})
-    h   = info.get("holders",  {})
-    sm  = info.get("smart",    {})
-    b   = info.get("bundle",   {})
-    v   = info.get("velocity", {})
-    auth= info.get("auth",     {})
-    liq = info.get("liquidity",{})
-    dev = info.get("dev",      {})
-    mom = info.get("momentum", {})
+    mcap     = float(px.get("mcap") or token.get("mcap") or 0)
+    liq      = float(px.get("liq_usd") or token.get("liq_usd") or 0)
+    vol      = float(px.get("volume_24h") or token.get("volume_24h") or 0)
+    chg_5m   = float(px.get("chg_5m") or token.get("chg_5m") or 0)
+    chg_1h   = float(px.get("chg_1h") or token.get("chg_1h") or 0)
+    chg_24h  = float(px.get("chg_24h") or token.get("chg_24h") or 0)
+    txns_h1  = int(px.get("txns_h1") or token.get("txns_h1") or 0)
+    vol_mcap = round(vol / mcap, 2) if mcap > 0 else 0
 
-    # ── 1. Safety first: Mint & Freeze authority (20 pts) ─────────────────────
-    # Weighted highest because active authority = dev can instantly destroy value
-    if auth.get("safe"):
-        auth_score = 20
-        boosts.append("🔒 Both authorities revoked — safe")
-    elif auth.get("mint_revoked") and not auth.get("freeze_revoked"):
-        auth_score = 12
-        warnings.append("⚠️ Freeze authority still active — dev can freeze wallets")
-    elif auth.get("freeze_revoked") and not auth.get("mint_revoked"):
-        auth_score = 8
-        warnings.append("⚠️ Mint authority still active — dev can print tokens")
+    # ── 1. Authority safety (25 pts) — highest weight, non-negotiable ──────────
+    if safety.get("safe"):
+        a_score = 25; boosts.append("🔒 Both authorities revoked")
+    elif safety.get("mint_revoked"):
+        a_score = 15; warnings.append("⚠️ Freeze authority active")
+    elif safety.get("freeze_revoked"):
+        a_score = 10; warnings.append("⚠️ Mint authority active — dev can print")
     else:
-        auth_score = 0
-        warnings.append("🚨 Both authorities active — dev can print AND freeze")
-    score += auth_score; bd["authority"] = auth_score
+        a_score = 0;  warnings.append("🚨 Both authorities active")
+    score += a_score; bd["authority"] = a_score
 
-    # ── 2. Real liquidity (15 pts) ────────────────────────────────────────────
-    # Real SOL in pool from DexScreener — not token balance proxies
-    liq_score = liq.get("score", 0)
-    score += liq_score; bd["liquidity"] = liq_score
-    tier = liq.get("liquidity_tier","unknown")
-    liq_usd = liq.get("liquidity_usd", 0)
-    if tier == "deep":     boosts.append(f"💧 Deep liquidity ${liq_usd:,.0f}")
-    elif tier == "solid":  boosts.append(f"💧 Solid liquidity ${liq_usd:,.0f}")
-    elif tier in ("very thin","unknown") and liq_usd < 5000:
-        warnings.append(f"⚠️ Very thin liquidity ${liq_usd:,.0f} — hard to exit")
+    # ── 2. Liquidity (20 pts) ──────────────────────────────────────────────────
+    if liq >= 50000:   l_score = 20; boosts.append(f"💧 Deep liquidity ${liq:,.0f}")
+    elif liq >= 20000: l_score = 15; boosts.append(f"💧 Solid liquidity ${liq:,.0f}")
+    elif liq >= 10000: l_score = 10
+    elif liq >= 5000:  l_score = 5
+    elif liq >= 1000:  l_score = 2
+    else:              l_score = 0;  warnings.append(f"⚠️ Very thin liquidity ${liq:,.0f}")
+    score += l_score; bd["liquidity"] = l_score
 
-    # ── 3. Holder distribution (15 pts) ───────────────────────────────────────
-    # LP-excluded real concentration
-    real_top1 = h.get("real_top1_pct", h.get("top1_pct", 100))
-    hd_score  = h.get("score", 0)
-    score += hd_score; bd["distribution"] = hd_score
-    if h.get("lp_excluded"):
-        boosts.append(f"📊 LP excluded — real top holder {real_top1}%")
-    if real_top1 > 35:
-        warnings.append(f"⚠️ Whale alert: real top holder owns {real_top1}%")
-    elif real_top1 < 5:
-        boosts.append("✅ Very healthy distribution")
+    # ── 3. Holder concentration (15 pts) ──────────────────────────────────────
+    real_top1 = holders.get("real_top1_pct", holders.get("top1_pct", 50))
+    if real_top1 < 5:    h_score = 15; boosts.append(f"✅ Great distribution — top holder {real_top1}%")
+    elif real_top1 < 10: h_score = 12
+    elif real_top1 < 20: h_score = 8
+    elif real_top1 < 35: h_score = 4;  warnings.append(f"⚠️ Top holder {real_top1}%")
+    elif real_top1 < 50: h_score = 1;  warnings.append(f"🚨 Whale alert: {real_top1}%")
+    else:                h_score = 0;  warnings.append(f"🚨 Top holder owns {real_top1}% — rug setup")
+    score += h_score; bd["distribution"] = h_score
 
-    # ── 4. Bundle/organic detection (15 pts) ──────────────────────────────────
-    if b.get("is_bundled"):
-        org_score = 0
-        warnings.append(f"🤖 Coordinated launch detected: {b.get('reason','')}")
-    elif b.get("confidence",0) > 30:
-        org_score = 7
-        warnings.append(f"🤖 Possible bot activity: {b.get('reason','')}")
+    # ── 4. Price momentum & direction (15 pts) ────────────────────────────────
+    if chg_1h > 50 and chg_5m > 0:
+        m_score = 15; boosts.append(f"🚀 Up {chg_1h:.0f}% in 1h and still climbing")
+    elif chg_1h > 20 and chg_5m > 0:
+        m_score = 12; boosts.append(f"📈 Strong momentum +{chg_1h:.0f}% 1h")
+    elif chg_1h > 5 and chg_5m > 0:
+        m_score = 9
+    elif chg_5m > 5:
+        m_score = 7;  boosts.append(f"📈 5m candle +{chg_5m:.0f}%")
+    elif chg_1h >= 0:
+        m_score = 5
+    elif chg_1h > -20:
+        m_score = 3;  warnings.append(f"📉 Down {abs(chg_1h):.0f}% in 1h")
     else:
-        org_score = 15
-        boosts.append("✅ Organic launch")
-    score += org_score; bd["organic"] = org_score
+        m_score = 0;  warnings.append(f"📉 Dumping — {chg_1h:.0f}% in 1h")
+    score += m_score; bd["momentum"] = m_score
 
-    # ── 5. Price momentum & vol/mcap ratio (15 pts) ───────────────────────────
-    mom_score = mom.get("score", 4)
-    score += mom_score; bd["momentum"] = mom_score
-    vol_mcap  = mom.get("vol_mcap_ratio", 0)
-    if mom.get("momentum") in ("accelerating","high_volume"):
-        boosts.append(f"📈 {mom.get('note','')}")
-    elif mom.get("momentum") in ("distribution","dumping"):
-        warnings.append(f"📉 {mom.get('note','')}")
-    if vol_mcap > 2:
-        boosts.append(f"🔥 Vol/MCap {vol_mcap:.1f}x — extremely active")
-    elif vol_mcap > 1:
-        boosts.append(f"📊 Vol/MCap {vol_mcap:.1f}x — strong volume")
-
-    # ── 6. Dev wallet safety (10 pts) ─────────────────────────────────────────
-    # Now uses real launch count, not raw tx count
-    if dev.get("is_serial"):
-        dev_score = 0
-        warnings.append(f"🚨 Serial token launcher — {dev.get('launches',0)} prior launches")
-    elif dev.get("risk") == "medium":
-        dev_score = 5
-        warnings.append(f"⚠️ Dev has launched {dev.get('launches',0)} tokens before")
-    else:
-        dev_score = 10
-    # Wallet age warning
-    age = dev.get("wallet_age","")
-    if "brand new" in age:
-        dev_score = max(0, dev_score - 3)
-        warnings.append(f"⚠️ Brand new deployer wallet — higher risk")
-    score += dev_score; bd["dev_safety"] = dev_score
-
-    # ── 7. TX velocity (5 pts) ────────────────────────────────────────────────
-    # Kept lower weight — velocity alone doesn't mean much without price confirmation
-    vel_score = v.get("score", 0)
-    score += vel_score; bd["tx_velocity"] = vel_score
-    if v.get("count",0) > 150:
-        boosts.append(f"⚡ {v['count']} transactions — high activity")
-
-    # ── 8. Smart money (5 pts base, up to 25 pts bonus) ───────────────────────
-    # Low base score when list is empty, full score when smart wallets detected
-    sm_score = sm.get("score", 3)
-    score += sm_score; bd["smart_money"] = sm_score
-    if sm.get("count",0) >= 3:
-        boosts.append(f"🐋 {sm['count']} smart wallets confirmed in")
-    elif sm.get("count",0) > 0:
-        boosts.append(f"🐋 {sm['count']} smart wallet spotted")
-
-    # ── 9. Vol/MCap ratio bonus (up to 5 pts) ────────────────────────────────
-    # High volume relative to market cap = real trading interest before price
-    # discovery. One of the strongest early runner signals in memecoins.
-    vol_mcap = mom.get("vol_mcap_ratio", 0)
-    if vol_mcap >= 3.0:   vm_score = 5; boosts.append(f"🔥 Vol/MCap {vol_mcap:.1f}x — extremely rare signal")
-    elif vol_mcap >= 1.5: vm_score = 4; boosts.append(f"📊 Vol/MCap {vol_mcap:.1f}x — very active")
-    elif vol_mcap >= 0.5: vm_score = 2
+    # ── 5. Volume / MCap ratio (10 pts) ───────────────────────────────────────
+    if vol_mcap >= 3.0:   vm_score = 10; boosts.append(f"🔥 Vol/MCap {vol_mcap:.1f}x — extraordinary")
+    elif vol_mcap >= 1.5: vm_score = 8;  boosts.append(f"🔥 Vol/MCap {vol_mcap:.1f}x — very high")
+    elif vol_mcap >= 0.5: vm_score = 5
+    elif vol_mcap >= 0.1: vm_score = 2
     else:                 vm_score = 0
-    score += vm_score; bd["vol_mcap_ratio"] = vm_score
+    score += vm_score; bd["vol_mcap"] = vm_score
 
-    # ── 10. Holder count (3 pts) ──────────────────────────────────────────────
-    hc = h.get("count", 0)
-    hc_score = 3 if hc > 100 else 2 if hc > 30 else 1 if hc > 10 else 0
-    score += hc_score; bd["holder_count"] = hc_score
+    # ── 6. Transaction activity (5 pts) ───────────────────────────────────────
+    if txns_h1 > 200:   t_score = 5; boosts.append(f"⚡ {txns_h1} buys in last hour")
+    elif txns_h1 > 80:  t_score = 4
+    elif txns_h1 > 30:  t_score = 3
+    elif txns_h1 > 10:  t_score = 2
+    else:               t_score = 1
+    score += t_score; bd["tx_activity"] = t_score
 
-    # ── 10. Graduation bonus (2 pts) ─────────────────────────────────────────
-    if info.get("graduated"):
-        score += 2; bd["graduation"] = 2
-        boosts.append("🎓 Graduated to PumpSwap")
+    # ── 7. Dev safety (5 pts) ─────────────────────────────────────────────────
+    if dev.get("deployer","") in blacklisted_devs:
+        d_score = 0; warnings.append("🚨 Blacklisted deployer")
+    elif dev.get("is_serial"):
+        d_score = 0; warnings.append(f"🚨 Serial launcher — {dev.get('launches',0)} prior mints")
+    elif dev.get("risk") == "medium":
+        d_score = 2; warnings.append(f"⚠️ Dev has {dev.get('launches',0)} prior launches")
+    elif dev.get("age_days", 999) < 1:
+        d_score = 2; warnings.append("⚠️ Brand new deployer wallet")
     else:
-        bd["graduation"] = 0
+        d_score = 5
+    score += d_score; bd["dev_safety"] = d_score
 
-    # ── Hard disqualifiers ────────────────────────────────────────────────────
+    # ── 8. Smart money (5 pts) ────────────────────────────────────────────────
+    sm_score = smart.get("score", 0)
+    score += sm_score; bd["smart_money"] = sm_score
+    if smart.get("count", 0) >= 2:
+        boosts.append(f"🐋 {smart['count']} smart wallets confirmed in early")
+    elif smart.get("count", 0) == 1:
+        boosts.append("🐋 Smart wallet spotted early")
+
+    # ── 9. Social signal — Pump.fun engagement (3 pts) ────────────────────────
+    replies = int(token.get("reply_count") or 0)
+    koth    = bool(token.get("king_of_hill"))
+    if koth:
+        s_score = 3; boosts.append("👑 King of the Hill on Pump.fun")
+    elif replies > 50:
+        s_score = 3; boosts.append(f"💬 {replies} community replies")
+    elif replies > 20:
+        s_score = 2
+    elif replies > 5:
+        s_score = 1
+    else:
+        s_score = 0
+    score += s_score; bd["social"] = s_score
+
+    # ── 10. Market cap positioning (2 pts — bonus for sweet spot) ─────────────
+    if 0 < mcap < 100000:
+        mc_score = 2; boosts.append(f"🎯 Early MCap ${mcap:,.0f} — high upside")
+    elif mcap < 500000:
+        mc_score = 2; boosts.append(f"📊 MCap ${mcap:,.0f}")
+    elif mcap < 2000000:
+        mc_score = 1
+    else:
+        mc_score = 0
+    score += mc_score; bd["mcap_position"] = mc_score
+
+    # ── Hard disqualifiers ─────────────────────────────────────────────────────
     hard_fail    = False
     fail_reasons = []
 
-    # Real whale concentration (LP excluded)
     if real_top1 > 50:
-        hard_fail = True; fail_reasons.append(f"single wallet owns {real_top1}% (LP excluded) — instant rug")
-
-    # Bundled AND no smart money = fabricated demand, zero real interest
-    if b.get("is_bundled") and sm.get("count",0) == 0:
-        hard_fail = True; fail_reasons.append("bundled launch + zero smart money")
-
-    # Serial rugger deployer
-    if dev.get("is_serial") and hc < 20:
-        hard_fail = True; fail_reasons.append(f"serial launcher ({dev.get('launches',0)} launches) + only {hc} holders")
-
-    # Blacklisted deployer
-    if info.get("deployer","") in blacklisted_devs:
-        hard_fail = True; fail_reasons.append("deployer blacklisted")
-
-    # Active authorities + whale = almost certain rug setup
-    if not auth.get("mint_revoked") and not auth.get("freeze_revoked") and real_top1 > 40:
-        hard_fail = True; fail_reasons.append("both authorities active + whale concentration")
-
-    # Actively dumping
-    if mom.get("momentum") == "dumping":
-        hard_fail = True; fail_reasons.append("token is actively dumping right now")
-
-    # No price data on established token = suspicious (new tokens get a pass)
-    px = info.get("price", {})
-    if not px.get("found") and info.get("sigs_count", 0) > 80:
-        hard_fail = True; fail_reasons.append("no market data found for established token")
-
-    # Zero liquidity = untradeable
-    if liq.get("liquidity_usd",0) == 0 and not info.get("graduated"):
-        hard_fail = True; fail_reasons.append("zero liquidity — cannot trade")
+        hard_fail = True; fail_reasons.append(f"top holder {real_top1}% (excl LP)")
+    if dev.get("deployer","") in blacklisted_devs:
+        hard_fail = True; fail_reasons.append("blacklisted deployer")
+    if dev.get("is_serial") and holders.get("count", 99) < 15:
+        hard_fail = True; fail_reasons.append("serial rugger + <15 holders")
+    if not safety.get("mint_revoked") and not safety.get("freeze_revoked") and real_top1 > 40:
+        hard_fail = True; fail_reasons.append("both auths active + whale concentration")
+    if chg_1h < -40 and vol_mcap < 0.3:
+        hard_fail = True; fail_reasons.append("heavy dump with no volume support")
+    if liq == 0 and mcap > 50000:
+        hard_fail = True; fail_reasons.append("no liquidity found for established token")
 
     if hard_fail:
         warnings.append(f"❌ HARD FAIL: {', '.join(fail_reasons)}")
 
-    # ── Rug risk rating ───────────────────────────────────────────────────────
-    if hard_fail or real_top1 > 40 or b.get("is_bundled") or not auth.get("mint_revoked"):
+    # ── Rug risk ───────────────────────────────────────────────────────────────
+    if hard_fail or real_top1 > 35 or (not safety.get("mint_revoked") and not safety.get("freeze_revoked")):
         rug_risk = "high"
-    elif real_top1 > 20 or b.get("confidence",0) > 30 or dev.get("risk") == "medium":
+    elif real_top1 > 20 or not safety.get("mint_revoked") or dev.get("risk") == "medium":
         rug_risk = "medium"
     else:
         rug_risk = "low"
 
-    final_score = 0 if hard_fail else min(99, score)
+    final = 0 if hard_fail else min(99, score)
 
-    # Plain-English conviction tier
-    if hard_fail:
-        conviction = "❌ DO NOT BUY"
-    elif final_score >= 88:
-        conviction = "💎 VERY HIGH CONVICTION"
-    elif final_score >= 78:
-        conviction = "🟢 HIGH CONVICTION — strong buy"
-    elif final_score >= 68:
-        conviction = "🟡 MODERATE — proceed with caution"
-    elif final_score >= 55:
-        conviction = "🟠 WEAK — high risk"
-    else:
-        conviction = "🔴 AVOID"
+    # ── Conviction label ───────────────────────────────────────────────────────
+    if hard_fail:      conviction = "❌ DO NOT BUY"
+    elif final >= 85:  conviction = "💎 VERY HIGH CONVICTION"
+    elif final >= 72:  conviction = "🟢 HIGH CONVICTION"
+    elif final >= 58:  conviction = "🟡 MODERATE — proceed carefully"
+    elif final >= 45:  conviction = "🟠 WEAK — high risk"
+    else:              conviction = "🔴 AVOID"
 
     return {
-        "total":      final_score,
+        "total":      final,
         "conviction": conviction,
         "rug_risk":   rug_risk,
         "hard_fail":  hard_fail,
@@ -784,21 +599,167 @@ def score_token(info: dict) -> dict:
     }
 
 
-# ── Launchpad detector ─────────────────────────────────────────────────────────
-def detect_launchpad(keys: list) -> tuple:
-    for k in keys:
-        if k in LAUNCHPADS:
-            return LAUNCHPADS[k]
-    return ("Unknown", "⚪")
+# ══════════════════════════════════════════════════════════════════════════════
+# ALERT FORMATTER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def fmt_usd(v) -> str:
+    try:
+        v = float(v)
+        if v >= 1_000_000: return f"${v/1_000_000:.2f}M"
+        if v >= 1_000:     return f"${v/1_000:.1f}K"
+        return f"${v:.2f}"
+    except: return "N/A"
+
+def fmt_pct(v) -> str:
+    try:
+        v = float(v)
+        return f"{'📈' if v >= 0 else '📉'} {v:+.1f}%"
+    except: return "N/A"
 
 
+def build_alert(token: dict, px: dict, safety: dict, holders: dict,
+                dev: dict, smart: dict, result: dict, source: str) -> str:
 
-# ── Multi-wallet copy signal ───────────────────────────────────────────────────
+    score  = result["total"]
+    rug    = result["rug_risk"]
+    re_em  = {"low":"🟢","medium":"🟡","high":"🔴"}.get(rug,"⚪")
+    lp_name, lp_emoji = token.get("launchpad", ("Unknown","⚪"))
+    bar    = "█" * round(score/10) + "░" * (10 - round(score/10))
+    bd     = result["breakdown"]
+
+    mcap   = float(px.get("mcap") or token.get("mcap") or 0)
+    liq    = float(px.get("liq_usd") or token.get("liq_usd") or 0)
+    vol    = float(px.get("volume_24h") or token.get("volume_24h") or 0)
+    price  = px.get("price_usd") or token.get("price_usd", "N/A")
+    chg_5m = px.get("chg_5m") or token.get("chg_5m", 0)
+    chg_1h = px.get("chg_1h") or token.get("chg_1h", 0)
+    mint   = token["mint"]
+    sym    = token.get("symbol", "") or token.get("name", "") or mint[:8]
+
+    source_tag = {
+        "launch":   "🆕 NEW LAUNCH",
+        "trending": "🔥 TRENDING — BUY SIGNAL",
+    }.get(source, "📊 SIGNAL")
+
+    boosts_txt   = "\n".join(result["boosts"])   or "None"
+    warnings_txt = "\n".join(result["warnings"]) or "None"
+
+    return (
+        f"🚨 *AlphaScan Alert — {source_tag}*\n\n"
+        f"*{sym}* | {lp_emoji} {lp_name}\n"
+        f"`{mint}`\n\n"
+        f"*Score:* {score}/99 `{bar}`\n"
+        f"*Conviction:* {result['conviction']}\n\n"
+        f"*Price:* ${price}  MCap: {fmt_usd(mcap)}\n"
+        f"*Volume:* {fmt_usd(vol)}  Liq: {fmt_usd(liq)}\n"
+        f"*Change:* 5m {fmt_pct(chg_5m)} | 1h {fmt_pct(chg_1h)}\n\n"
+        f"*Score breakdown:*\n"
+        f"  🔒 Authority:    {bd.get('authority',0)}/25\n"
+        f"  💧 Liquidity:    {bd.get('liquidity',0)}/20\n"
+        f"  📊 Distribution: {bd.get('distribution',0)}/15\n"
+        f"  📈 Momentum:     {bd.get('momentum',0)}/15\n"
+        f"  🔥 Vol/MCap:     {bd.get('vol_mcap',0)}/10\n"
+        f"  ⚡ TX Activity:  {bd.get('tx_activity',0)}/5\n"
+        f"  🛡 Dev safety:   {bd.get('dev_safety',0)}/5\n"
+        f"  🐋 Smart money:  {bd.get('smart_money',0)}/5\n"
+        f"  💬 Social:       {bd.get('social',0)}/3\n"
+        f"  🎯 MCap pos:     {bd.get('mcap_position',0)}/2\n\n"
+        f"*Safety:*\n"
+        f"  Mint auth: {'✅ Revoked' if safety.get('mint_revoked') else '🚨 Active'} | "
+        f"Freeze: {'✅ Revoked' if safety.get('freeze_revoked') else '🚨 Active'}\n"
+        f"  Top holder: {holders.get('real_top1_pct',0)}% {'(LP excl.)' if holders.get('lp_excluded') else ''} | "
+        f"Holders: {holders.get('count',0)}\n"
+        f"  Dev launches: {dev.get('launches',0)} | "
+        f"Wallet age: {dev.get('age_days',0)}d\n\n"
+        f"*✅ Signals:*\n{boosts_txt}\n\n"
+        f"*⚠️ Warnings:*\n{warnings_txt}\n\n"
+        f"*Rug risk:* {re_em} {rug.upper()}\n\n"
+        f"🔗 [DexScreener](https://dexscreener.com/solana/{mint}) | "
+        f"[Birdeye](https://birdeye.so/token/{mint}?chain=solana) | "
+        f"[Solscan](https://solscan.io/token/{mint})\n\n"
+        f"_Scanned {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC_"
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CORE PROCESSING PIPELINE
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def process_token(session, bot: Bot, token: dict) -> bool:
+    """Enrich a token candidate, score it, and alert if it passes."""
+    mint   = token["mint"]
+    source = token.get("source", "launch")
+
+    # Fetch all signals — price first since it's fastest and pre-filters most
+    px = await get_price_data(session, mint)
+
+    # Pre-filter before expensive RPC calls
+    mcap  = float(px.get("mcap") or token.get("mcap") or 0)
+    liq   = float(px.get("liq_usd") or token.get("liq_usd") or 0)
+    chg_1h = float(px.get("chg_1h") or 0)
+
+    # Skip if already pumped > 2000% (you've missed it) or clearly dead
+    if chg_1h > 2000:
+        log.debug(f"Skip {mint[:8]} — already up {chg_1h:.0f}%")
+        return False
+    if chg_1h < -70 and liq < 2000:
+        log.debug(f"Skip {mint[:8]} — dumping and no liquidity")
+        return False
+
+    # Fetch remaining signals in parallel
+    safety, holders, dev, smart = await asyncio.gather(
+        get_token_safety(session, mint),
+        get_holders(session, mint),
+        get_dev_info(session, mint),
+        check_smart_money(session, mint),
+    )
+
+    result = score_token(token, px, safety, holders, dev, smart)
+    score  = result["total"]
+    sym    = token.get("symbol") or token.get("name") or mint[:8]
+
+    log.info(f"[{source}] {sym} ({mint[:8]}) score={score} conviction={result['conviction']} rug={result['rug_risk']}")
+
+    if score < alert_threshold or result["hard_fail"]:
+        return False
+
+    msg = build_alert(token, px, safety, holders, dev, smart, result, source)
+    await bot.send_message(
+        chat_id=TELEGRAM_CHAT_ID,
+        text=msg,
+        parse_mode="Markdown",
+        disable_web_page_preview=True
+    )
+
+    tracked_alerts[mint] = {
+        "score": score, "time": datetime.now(timezone.utc),
+        "launchpad": token.get("launchpad"), "reported": False,
+        "source": source, "symbol": sym,
+    }
+    daily_top.append({"mint": mint, "score": score, "symbol": sym,
+                      "launchpad": token.get("launchpad"), "source": source})
+
+    # Track first buyers for smart wallet learning
+    winner_tracker[mint] = {"score": score, "time": datetime.now(timezone.utc)}
+
+    # Copy signal tracking
+    if smart.get("count", 0) >= 2:
+        if mint not in copy_signal_cache:
+            copy_signal_cache[mint] = {
+                "wallets": smart["wallets"],
+                "first_seen": datetime.now(timezone.utc),
+                "alerted": False,
+            }
+
+    return True
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# COPY SIGNAL
+# ══════════════════════════════════════════════════════════════════════════════
+
 async def check_copy_signals(bot: Bot):
-    """
-    Fire a special HIGH CONVICTION alert when 3+ smart wallets
-    independently bought the same token within a short window.
-    """
     now = datetime.now(timezone.utc)
     for mint, data in list(copy_signal_cache.items()):
         if data.get("alerted"):
@@ -806,626 +767,83 @@ async def check_copy_signals(bot: Bot):
         wallets = data.get("wallets", [])
         if len(wallets) < 3:
             continue
-        # Only alert within 30 minutes of first detection
-        age_mins = (now - data["first_seen"]).total_seconds() / 60
-        if age_mins > 30:
+        age = (now - data["first_seen"]).total_seconds() / 60
+        if age > 30:
             copy_signal_cache[mint]["alerted"] = True
             continue
         copy_signal_cache[mint]["alerted"] = True
-        short_wallets = [f"`{w[:6]}...{w[-4:]}`" for w in wallets[:5]]
+        wlist = "\n".join(f"`{w[:8]}...{w[-4:]}`" for w in wallets[:5])
         await bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
             text=(
-                f"🔥 *COPY SIGNAL — HIGH CONVICTION*\n\n"
-                f"*{len(wallets)} smart wallets* bought the same token\n"
+                f"🔥 *HIGH CONVICTION COPY SIGNAL*\n\n"
+                f"*{len(wallets)} smart wallets* independently bought:\n"
                 f"`{mint}`\n\n"
-                f"*Wallets:*\n" + "\n".join(short_wallets) + "\n\n"
-                f"*Time since first buy:* {age_mins:.1f} min\n\n"
-                f"This is a rare signal. Do your own checks first.\n\n"
+                f"*Wallets:*\n{wlist}\n\n"
+                f"*Time since first buy:* {age:.0f} min\n\n"
                 f"🔗 [DexScreener](https://dexscreener.com/solana/{mint}) | "
                 f"[Birdeye](https://birdeye.so/token/{mint}?chain=solana)"
             ),
-            parse_mode="Markdown",
-            disable_web_page_preview=True
+            parse_mode="Markdown", disable_web_page_preview=True
         )
-        log.info(f"Copy signal fired for {mint[:8]} — {len(wallets)} wallets")
-
-# ── Fetch new token mints ──────────────────────────────────────────────────────
-
-# ══════════════════════════════════════════════════════════════════════════════
-# DUAL SCANNER ENGINE
-# Scanner 1: Real-time launch detection  — catches tokens seconds after mint
-# Scanner 2: Momentum scanner            — catches any-age tokens gaining steam
-# ══════════════════════════════════════════════════════════════════════════════
-
-# ── Pump.fun program address (the real one) ────────────────────────────────────
-PUMPFUN_PROGRAM  = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
-LETSBONK_PROGRAM = "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj"
-RAYDIUM_PROGRAM  = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"  # Raydium AMM v4
-
-# Momentum tracker — persists across scans
-momentum_tracker = {}  # mint -> {vol_samples: [], buyer_samples: [], first_seen, launchpad}
-trending_tracker  = {}  # mint -> {snapshots: [], first_seen, alerted}
-
-# ── SCANNER 1: Real-time Pump.fun launch detection ────────────────────────────
-async def scanner1_new_launches(session) -> list:
-    """
-    Watch Pump.fun and LetsBonk program accounts directly.
-    Catches tokens within 1-2 scan cycles of launch.
-    Much faster than watching the generic Token Program.
-    """
-    mints = []
-    programs = [
-        (PUMPFUN_PROGRAM,  ("Pump.fun",     "🟢")),
-        (LETSBONK_PROGRAM, ("LetsBonk.fun", "🟡")),
-    ]
-    for program_addr, launchpad in programs:
-        try:
-            sigs = await rpc(session, "getSignaturesForAddress", [
-                program_addr, {"limit": 40}
-            ])
-            for s in (sigs or [])[:20]:
-                try:
-                    tx = await rpc(session, "getTransaction", [
-                        s["signature"],
-                        {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}
-                    ])
-                    if not tx:
-                        continue
-                    msg  = tx.get("transaction", {}).get("message", {})
-                    keys = [
-                        a.get("pubkey","") if isinstance(a,dict) else str(a)
-                        for a in msg.get("accountKeys", [])
-                    ]
-                    for ix in msg.get("instructions", []) + [
-                        inner
-                        for group in (tx.get("meta", {}).get("innerInstructions") or [])
-                        for inner in group.get("instructions", [])
-                    ]:
-                        p = ix.get("parsed", {})
-                        if isinstance(p, dict) and p.get("type") == "initializeMint":
-                            mint = p.get("info", {}).get("mint")
-                            if mint and mint not in seen_mints:
-                                mints.append((mint, launchpad, "launch"))
-                except Exception:
-                    continue
-        except Exception as e:
-            log.debug(f"Scanner1 {program_addr[:8]}: {e}")
-
-    # Also check Raydium for new pool creations (tokens listing directly)
-    try:
-        sigs = await rpc(session, "getSignaturesForAddress", [RAYDIUM_PROGRAM, {"limit": 20}])
-        for s in (sigs or [])[:10]:
-            try:
-                tx = await rpc(session, "getTransaction", [
-                    s["signature"],
-                    {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}
-                ])
-                if not tx:
-                    continue
-                msg  = tx.get("transaction", {}).get("message", {})
-                keys = [
-                    a.get("pubkey","") if isinstance(a,dict) else str(a)
-                    for a in msg.get("accountKeys", [])
-                ]
-                # New Raydium pool = token listing directly on DEX
-                for ix in msg.get("instructions", []):
-                    p = ix.get("parsed", {})
-                    if isinstance(p, dict) and p.get("type") == "initializeMint":
-                        mint = p.get("info", {}).get("mint")
-                        if mint and mint not in seen_mints:
-                            mints.append((mint, ("Raydium LaunchLab", "🔵"), "launch"))
-            except Exception:
-                continue
-    except Exception as e:
-        log.debug(f"Scanner1 Raydium: {e}")
-
-    return mints[:15]
-
-
-# ── SCANNER 2: Momentum scanner (any-age tokens) ──────────────────────────────
-async def scanner2_momentum(session) -> list:
-    """
-    Detect tokens of ANY age that are suddenly gaining momentum.
-    Strategy:
-      - Sample recent DEX activity from Raydium & PumpSwap
-      - For each token seen, track volume samples over time
-      - Alert when: volume accelerating + new unique buyers + price still reasonable
-    """
-    candidates = []
-    try:
-        # Get recent Raydium swap transactions — these are real trades
-        sigs = await rpc(session, "getSignaturesForAddress", [
-            RAYDIUM_PROGRAM, {"limit": 50}
-        ])
-        token_activity = defaultdict(lambda: {"txs": 0, "slots": []})
-
-        for s in (sigs or [])[:30]:
-            try:
-                tx = await rpc(session, "getTransaction", [
-                    s["signature"],
-                    {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}
-                ])
-                if not tx:
-                    continue
-                slot = tx.get("slot", 0)
-                # Extract token mints from post token balances
-                post_balances = tx.get("meta", {}).get("postTokenBalances", [])
-                for bal in post_balances:
-                    mint = bal.get("mint")
-                    if not mint:
-                        continue
-                    # Skip stablecoins and wrapped SOL
-                    if mint in {
-                        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
-                        "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
-                        "So11111111111111111111111111111111111111112",    # wSOL
-                    }:
-                        continue
-                    token_activity[mint]["txs"] += 1
-                    token_activity[mint]["slots"].append(slot)
-            except Exception:
-                continue
-
-        # Score each token by momentum signals
-        now = datetime.now(timezone.utc)
-        for mint, activity in token_activity.items():
-            if mint in seen_mints:
-                continue
-            txs   = activity["txs"]
-            slots = activity["slots"]
-
-            # Need at least 3 txs to have a signal
-            if txs < 3:
-                continue
-
-            # Track across scans
-            if mint not in momentum_tracker:
-                momentum_tracker[mint] = {
-                    "samples":    [],
-                    "first_seen": now,
-                    "launchpad":  ("Raydium", "🔵"),
-                    "alerted":    False,
-                }
-
-            entry = momentum_tracker[mint]
-            if entry.get("alerted"):
-                continue
-
-            entry["samples"].append({"txs": txs, "time": now, "slots": slots})
-            # Keep only last 10 samples
-            entry["samples"] = entry["samples"][-10:]
-
-            # Need at least 2 samples to measure acceleration
-            if len(entry["samples"]) < 2:
-                continue
-
-            prev_txs    = entry["samples"][-2]["txs"]
-            current_txs = entry["samples"][-1]["txs"]
-
-            # Momentum trigger: activity at least doubled since last scan
-            # OR sustained high activity (10+ txs seen in one scan window)
-            momentum_score = 0
-            momentum_reason = ""
-
-            if current_txs >= prev_txs * 2 and current_txs >= 4:
-                momentum_score  = 80
-                momentum_reason = f"volume 2x spike ({prev_txs}→{current_txs} txs)"
-            elif current_txs >= 6:
-                momentum_score  = 65
-                momentum_reason = f"high sustained activity ({current_txs} txs)"
-            elif current_txs >= prev_txs * 1.5 and current_txs >= 3:
-                momentum_score  = 55
-                momentum_reason = f"growing activity ({prev_txs}→{current_txs} txs)"
-
-            if momentum_score >= 65:
-                candidates.append((mint, entry["launchpad"], "momentum", momentum_reason, momentum_score))
-                log.info(f"Momentum candidate: {mint[:8]} — {momentum_reason}")
-
-    except Exception as e:
-        log.warning(f"Scanner2: {e}")
-
-    return candidates[:8]
-
-
-# ── Process and alert a token ──────────────────────────────────────────────────
-async def process_token(session, bot: Bot, mint: str, launchpad: tuple,
-                        source: str, extra: dict = None):
-    """Enrich, score and conditionally alert on a single token."""
-    info = await enrich_token(session, mint, launchpad)
-    if not info:
-        return False
-
-    result = score_token(info)
-    score  = result["total"]
-    lp_name, _ = launchpad
-
-    log.info(
-        f"[{source}] {mint[:8]} score={score} "
-        f"rug={result['rug_risk']} lp={lp_name} fail={result['hard_fail']}"
-    )
-
-    if score < alert_threshold or result["hard_fail"]:
-        return False
-
-    # Build alert with source tag
-    source_tag = {
-        "launch":   "🆕 *NEW LAUNCH*",
-        "momentum": "📊 *MOMENTUM DETECTED*",
-        "trending": "🔥 *TRENDING — BUY SIGNAL*",
-    }.get(source, "🔍 *SIGNAL*")
-
-    momentum_note = ""
-    if source == "momentum" and extra:
-        momentum_note = f"*Momentum:* {extra.get('reason','')}\n\n"
-
-    text = format_alert(mint, info, result)
-    # Inject source tag and momentum note after first line
-    lines = text.split("\n", 1)
-    text  = lines[0] + "\n" + source_tag + "\n" + momentum_note + (lines[1] if len(lines)>1 else "")
-
-    await bot.send_message(
-        chat_id=TELEGRAM_CHAT_ID,
-        text=text,
-        parse_mode="Markdown",
-        disable_web_page_preview=True
-    )
-    tracked_alerts[mint] = {
-        "score": score, "time": datetime.now(timezone.utc),
-        "launchpad": launchpad, "reported": False, "source": source
-    }
-    daily_top.append({"mint": mint, "score": score, "launchpad": launchpad, "source": source})
-
-    if source == "momentum" and mint in momentum_tracker:
-        momentum_tracker[mint]["alerted"] = True
-
-    return True
-
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SCANNER 3: Trending token detector
-# Sources: DexScreener trending + Birdeye top tokens
-# Gates:   volume accelerating, mcap < $5M, price not already pumped,
-#          liquidity > $10K, full 10-signal safety check
+# WATCHLIST & PERFORMANCE TRACKERS
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Tunable limits (can expose as env vars later)
-TRENDING_MAX_MCAP_USD    = float(os.environ.get("TRENDING_MAX_MCAP",    "5000000"))   # $5M
-TRENDING_MIN_LIQ_USD     = float(os.environ.get("TRENDING_MIN_LIQ",     "10000"))     # $10K
-TRENDING_MAX_PUMP_1H_PCT = float(os.environ.get("TRENDING_MAX_PUMP_1H", "500"))       # 500%
-TRENDING_MIN_VOL_USD     = float(os.environ.get("TRENDING_MIN_VOL",     "5000"))      # $5K 24h vol
-
-async def scanner3_trending(session) -> list:
-    """
-    Pull trending Solana tokens from DexScreener and Birdeye.
-    Apply 6-gate filter before returning candidates.
-    Only returns tokens that are worth buying RIGHT NOW.
-    """
-    candidates = []
-    seen_this_scan = set()
-
-    # ── Source A: DexScreener trending profiles ────────────────────────────────
-    try:
-        async with session.get(
-            "https://api.dexscreener.com/token-profiles/latest/v1",
-            timeout=aiohttp.ClientTimeout(total=10)
-        ) as r:
-            if r.status == 200:
-                items = await r.json()
-                for item in (items or [])[:30]:
-                    if item.get("chainId") != "solana":
-                        continue
-                    mint = item.get("tokenAddress", "")
-                    if not mint or mint in seen_mints or mint in seen_this_scan:
-                        continue
-                    seen_this_scan.add(mint)
-                    candidates.append((mint, ("DexScreener Trending", "🔥"), "trending"))
-    except Exception as e:
-        log.debug(f"Scanner3 DexScreener profiles: {e}")
-
-    # ── Source B: DexScreener boosted tokens (paid attention = community active) ─
-    try:
-        async with session.get(
-            "https://api.dexscreener.com/token-boosts/latest/v1",
-            timeout=aiohttp.ClientTimeout(total=10)
-        ) as r:
-            if r.status == 200:
-                items = await r.json()
-                for item in (items or [])[:20]:
-                    if item.get("chainId") != "solana":
-                        continue
-                    mint = item.get("tokenAddress", "")
-                    if not mint or mint in seen_mints or mint in seen_this_scan:
-                        continue
-                    seen_this_scan.add(mint)
-                    candidates.append((mint, ("DexScreener Boosted", "⚡"), "trending"))
-    except Exception as e:
-        log.debug(f"Scanner3 DexScreener boosts: {e}")
-
-    # ── Source C: DexScreener new pairs with volume on Solana ─────────────────
-    try:
-        async with session.get(
-            "https://api.dexscreener.com/latest/dex/search?q=SOL",
-            timeout=aiohttp.ClientTimeout(total=10)
-        ) as r:
-            if r.status == 200:
-                data  = await r.json()
-                pairs = data.get("pairs") or []
-                # Sort by 1h volume change
-                sol_pairs = [
-                    p for p in pairs
-                    if p.get("chainId") == "solana"
-                    and p.get("baseToken", {}).get("address") not in seen_mints
-                ]
-                sol_pairs.sort(
-                    key=lambda p: abs(float(p.get("priceChange", {}).get("h1") or 0)),
-                    reverse=True
-                )
-                for p in sol_pairs[:15]:
-                    mint = p.get("baseToken", {}).get("address", "")
-                    if not mint or mint in seen_this_scan:
-                        continue
-                    seen_this_scan.add(mint)
-                    candidates.append((mint, ("DexScreener Pairs", "📊"), "trending"))
-    except Exception as e:
-        log.debug(f"Scanner3 DexScreener pairs: {e}")
-
-    log.info(f"Scanner3 raw candidates: {len(candidates)}")
-
-    # ── Apply 6-gate filter ────────────────────────────────────────────────────
-    actionable = []
-    for mint, launchpad, source in candidates:
-        if mint in seen_mints:
-            continue
-        try:
-            # Fetch price data first — cheapest gate, filters most tokens
-            px = await fetch_price_data(session, mint)
-            if not px.get("found"):
-                continue
-
-            mcap     = float(px.get("mcap")    or 0)
-            liq      = float(px.get("liquidity") or 0)
-            vol_24h  = float(px.get("volume_24h") or 0)
-            chg_1h   = float(px.get("price_change_1h")  or 0)
-            chg_5m   = float(px.get("price_change_5m")  or 0)
-            chg_24h  = float(px.get("price_change_24h") or 0)
-
-            fail_reason = None
-
-            # Gate 1 — Market cap ceiling (still early enough)
-            if mcap > TRENDING_MAX_MCAP_USD:
-                fail_reason = f"mcap ${mcap/1e6:.1f}M > ${TRENDING_MAX_MCAP_USD/1e6:.0f}M ceiling"
-
-            # Gate 2 — Already pumped too hard (you've missed it)
-            elif chg_1h > TRENDING_MAX_PUMP_1H_PCT:
-                fail_reason = f"already up {chg_1h:.0f}% in 1h — too late"
-
-            # Gate 3 — Minimum liquidity (can actually enter/exit)
-            elif liq < TRENDING_MIN_LIQ_USD:
-                fail_reason = f"liquidity ${liq:.0f} < ${TRENDING_MIN_LIQ_USD:.0f} minimum"
-
-            # Gate 4 — Minimum volume (real interest, not ghost)
-            elif vol_24h < TRENDING_MIN_VOL_USD:
-                fail_reason = f"volume ${vol_24h:.0f} too low"
-
-            # Gate 5 — Must be going UP, not dumping
-            elif chg_5m < -15:
-                fail_reason = f"dumping {chg_5m:.1f}% in 5m — skip"
-
-            # Gate 6 — Momentum must be accelerating (5m positive, not topped)
-            elif chg_24h > 1000 and chg_1h < 0:
-                fail_reason = f"24h pump {chg_24h:.0f}% but 1h negative — topped out"
-
-            if fail_reason:
-                log.debug(f"Scanner3 gate fail {mint[:8]}: {fail_reason}")
-                continue
-
-            # Track across scans for volume acceleration check
-            now = datetime.now(timezone.utc)
-            if mint not in trending_tracker:
-                trending_tracker[mint] = {
-                    "snapshots":  [],
-                    "first_seen": now,
-                    "alerted":    False,
-                }
-            entry = trending_tracker[mint]
-            if entry.get("alerted"):
-                continue
-
-            entry["snapshots"].append({
-                "vol": vol_24h, "mcap": mcap,
-                "chg_5m": chg_5m, "chg_1h": chg_1h,
-                "time": now
-            })
-            entry["snapshots"] = entry["snapshots"][-6:]
-
-            # Need at least 2 snapshots to confirm trend is holding
-            if len(entry["snapshots"]) < 2:
-                log.debug(f"Scanner3 {mint[:8]}: first sighting, waiting for confirmation")
-                continue
-
-            prev_vol  = entry["snapshots"][-2]["vol"]
-            prev_chg  = entry["snapshots"][-2]["chg_1h"]
-
-            # Volume must be growing OR already substantial
-            vol_growing = vol_24h >= prev_vol * 1.1 or vol_24h > 50000
-
-            if not vol_growing:
-                log.debug(f"Scanner3 {mint[:8]}: volume not growing ({prev_vol:.0f}→{vol_24h:.0f})")
-                continue
-
-            # Build entry reason for alert
-            reasons = []
-            if chg_5m > 5:   reasons.append(f"5m: +{chg_5m:.1f}%")
-            if chg_1h > 10:  reasons.append(f"1h: +{chg_1h:.1f}%")
-            if chg_24h > 0:  reasons.append(f"24h: +{chg_24h:.1f}%")
-            reasons.append(f"MCap: {fmt_usd(mcap)}")
-            reasons.append(f"Liq: {fmt_usd(liq)}")
-            if vol_24h > prev_vol * 1.5:
-                reasons.append(f"Vol +{((vol_24h/prev_vol-1)*100):.0f}% vs last scan")
-
-            actionable.append((
-                mint, launchpad, "trending",
-                {"reason": " | ".join(reasons), "px": px}
-            ))
-            log.info(f"Scanner3 actionable: {mint[:8]} — {' | '.join(reasons)}")
-
-        except Exception as e:
-            log.debug(f"Scanner3 gate check {mint[:8]}: {e}")
-            continue
-
-    return actionable[:6]  # cap at 6 per scan to avoid alert spam
-
-# ── Main scan loop (triple scanner) ─────────────────────────────────────────────
-async def scan_loop(bot: Bot):
-    last_summary_hour = -1
-    scan_count        = 0
-
-    async with aiohttp.ClientSession() as session:
-        while True:
-            scan_count += 1
-            log.info(f"═══ Scan #{scan_count} ═══")
-
-            try:
-                # Run all three scanners in parallel
-                launches, momentum, trending = await asyncio.gather(
-                    scanner1_new_launches(session),
-                    scanner2_momentum(session),
-                    scanner3_trending(session),
-                )
-                log.info(f"Scanner1: {len(launches)} | Scanner2: {len(momentum)} | Scanner3: {len(trending)}")
-
-                alerted = 0
-
-                # Process new launches
-                for item in launches:
-                    mint, launchpad = item[0], item[1]
-                    if mint in seen_mints:
-                        continue
-                    seen_mints.add(mint)
-                    fired = await process_token(session, bot, mint, launchpad, "launch")
-                    if fired:
-                        alerted += 1
-                        await asyncio.sleep(1.5)
-
-                # Process momentum candidates
-                for item in momentum:
-                    mint, launchpad, source, reason, mscore = item
-                    if mint in seen_mints:
-                        continue
-                    seen_mints.add(mint)
-                    fired = await process_token(
-                        session, bot, mint, launchpad, "momentum",
-                        extra={"reason": reason, "score": mscore}
-                    )
-                    if fired:
-                        alerted += 1
-                        await asyncio.sleep(1.5)
-
-                # Process trending candidates
-                for item in trending:
-                    mint, launchpad, source, extra = item
-                    if mint in seen_mints:
-                        continue
-                    seen_mints.add(mint)
-                    fired = await process_token(
-                        session, bot, mint, launchpad, "trending",
-                        extra=extra
-                    )
-                    if fired:
-                        alerted += 1
-                        if mint in trending_tracker:
-                            trending_tracker[mint]["alerted"] = True
-                        await asyncio.sleep(1.5)
-
-                # Housekeeping
-                await scan_watchlist(session, bot)
-                await check_copy_signals(bot)
-                if scan_count % 10 == 0:
-                    await check_performance(bot, session)
-                # Clean up old momentum tracker entries (> 2 hours old)
-                if scan_count % 30 == 0:
-                    cutoff = datetime.now(timezone.utc)
-                    stale  = [
-                        m for m, d in momentum_tracker.items()
-                        if (cutoff - d["first_seen"]).total_seconds() > 7200
-                    ]
-                    for m in stale:
-                        momentum_tracker.pop(m, None)
-                    if stale:
-                        log.info(f"Cleaned {len(stale)} stale momentum entries")
-                    # Clean stale trending entries
-                    stale_t = [
-                        m for m, d in trending_tracker.items()
-                        if (cutoff - d["first_seen"]).total_seconds() > 3600
-                    ]
-                    for m in stale_t:
-                        trending_tracker.pop(m, None)
-
-                hour = datetime.now(timezone.utc).hour
-                if hour == 9 and last_summary_hour != 9:
-                    await send_daily_summary(bot)
-                    last_summary_hour = 9
-                elif hour != 9:
-                    last_summary_hour = hour
-
-                log.info(f"Scan #{scan_count} done — {alerted} alerts fired")
-
-            except Exception as e:
-                log.error(f"Scan loop error: {e}")
-
-            await asyncio.sleep(SCAN_INTERVAL)
-
-# ── Watchlist scanner ──────────────────────────────────────────────────────────
 async def scan_watchlist(session, bot: Bot):
     for addr, label in list(watchlist_wallets.items()):
-        cache_key = f"wl_{addr}"
         try:
             sigs = await rpc(session, "getSignaturesForAddress", [addr, {"limit": 3}])
             if not sigs:
                 continue
             sig = sigs[0]["signature"]
-            if f"wl_sig_{sig}" in seen_mints:
+            key = f"wl_sig_{sig}"
+            if key in seen_mints:
                 continue
-            seen_mints.add(f"wl_sig_{sig}")
+            seen_mints.add(key)
             await bot.send_message(
                 chat_id=TELEGRAM_CHAT_ID,
                 text=(
-                    f"👁 *Watchlist Move*\n\n"
-                    f"*{label}* just transacted\n"
+                    f"👁 *Watchlist — {label}*\n\n"
                     f"`{addr[:8]}...{addr[-4:]}`\n\n"
-                    f"🔗 [View on Solscan](https://solscan.io/account/{addr})"
+                    f"Just made a transaction\n"
+                    f"🔗 [Solscan](https://solscan.io/account/{addr})"
                 ),
                 parse_mode="Markdown", disable_web_page_preview=True
             )
         except Exception as e:
             log.debug(f"Watchlist {addr[:8]}: {e}")
 
-# ── Performance tracker ────────────────────────────────────────────────────────
+
 async def check_performance(bot: Bot, session):
     now = datetime.now(timezone.utc)
     for mint, data in list(tracked_alerts.items()):
         if data.get("reported"):
             continue
-        age_hours = (now - data["time"]).total_seconds() / 3600
-        if age_hours < 24:
+        if (now - data["time"]).total_seconds() < 86400:
             continue
         try:
-            sigs = await rpc(session, "getSignaturesForAddress", [mint, {"limit": 50}])
-            txs  = len(sigs) if sigs else 0
-            if txs > 100:   verdict, emoji = "Still very active — likely pumping", "🟢"
-            elif txs > 20:  verdict, emoji = "Moderate activity", "🟡"
-            else:           verdict, emoji = "Low activity — likely dumped", "🔴"
-            lp_name, lp_emoji = data.get("launchpad", ("?", "⚪"))
+            px = await get_price_data(session, mint)
+            if px.get("found"):
+                chg = float(px.get("chg_24h") or 0)
+                if chg > 100:    verdict, em = f"🚀 Up {chg:.0f}% — great call", "🟢"
+                elif chg > 0:    verdict, em = f"📈 Up {chg:.0f}%", "🟡"
+                elif chg > -50:  verdict, em = f"📉 Down {abs(chg):.0f}%", "🟡"
+                else:            verdict, em = f"💀 Down {abs(chg):.0f}% — dumped", "🔴"
+            else:
+                verdict, em = "No price data — may be dead", "⚪"
+
+            sym = data.get("symbol", mint[:8])
+            lp_name, lp_emoji = data.get("launchpad", ("?","⚪"))
             await bot.send_message(
                 chat_id=TELEGRAM_CHAT_ID,
                 text=(
-                    f"📊 *24h Report*\n\n"
-                    f"{emoji} `{mint[:8]}...{mint[-4:]}`\n"
-                    f"{lp_emoji} {lp_name} | Score was *{data['score']}*\n\n"
-                    f"{verdict}\n"
-                    f"24h TX count: {txs}\n\n"
+                    f"📊 *24h Report — {sym}*\n\n"
+                    f"{em} {verdict}\n"
+                    f"Alert score was: *{data['score']}*\n"
+                    f"{lp_emoji} {lp_name}\n\n"
                     f"🔗 [DexScreener](https://dexscreener.com/solana/{mint})"
                 ),
                 parse_mode="Markdown", disable_web_page_preview=True
@@ -1434,103 +852,188 @@ async def check_performance(bot: Bot, session):
         except Exception as e:
             log.debug(f"Perf check {mint[:8]}: {e}")
 
-# ── Daily summary ──────────────────────────────────────────────────────────────
+
 async def send_daily_summary(bot: Bot):
     if not daily_top:
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID,
-            text="📋 *Daily Summary*\n\nNo tokens hit threshold today.", parse_mode="Markdown")
+            text="📋 *Daily Summary*\n\nNo tokens alerted today.", parse_mode="Markdown")
         return
     top5  = sorted(daily_top, key=lambda x: x["score"], reverse=True)[:5]
     lines = ["📋 *AlphaScan Daily Top Tokens*\n"]
     for i, t in enumerate(top5, 1):
         lp_name, lp_emoji = t.get("launchpad", ("?","⚪"))
-        lines.append(f"{i}. `{t['mint'][:8]}...` Score *{t['score']}* {lp_emoji} {lp_name}")
-        lines.append(f"   https://dexscreener.com/solana/{t['mint']}")
+        src = "🆕" if t.get("source") == "launch" else "🔥"
+        lines.append(f"{src} {i}. *{t.get('symbol','?')}* — Score *{t['score']}* {lp_emoji}")
+        lines.append(f"   `{t['mint']}`")
     lines.append(f"\n_Total alerts: {len(daily_top)}_")
-    await bot.send_message(chat_id=TELEGRAM_CHAT_ID,
-        text="\n".join(lines), parse_mode="Markdown", disable_web_page_preview=True)
+    await bot.send_message(
+        chat_id=TELEGRAM_CHAT_ID,
+        text="\n".join(lines),
+        parse_mode="Markdown", disable_web_page_preview=True
+    )
     daily_top.clear()
 
-# ── Alert formatter ────────────────────────────────────────────────────────────
-def format_alert(mint: str, info: dict, result: dict) -> str:
-    score     = result["total"]
-    rug       = result["rug_risk"]
-    re_emoji  = {"low":"🟢","medium":"🟡","high":"🔴"}.get(rug,"⚪")
-    lp_name, lp_emoji = info.get("launchpad", ("Unknown","⚪"))
-    bar        = "█" * round(score/10) + "░" * (10 - round(score/10))
-    conviction = result.get("conviction", "")
-    bd         = result["breakdown"]
-    auth      = info.get("auth", {})
-    liq       = info.get("liquidity", {})
-    mom       = info.get("momentum", {})
-    h         = info.get("holders", {})
-    px        = info.get("price", {})
 
-    boosts_txt   = "\n".join(result["boosts"])   or "—"
-    warnings_txt = "\n".join(result["warnings"]) or "—"
+# ══════════════════════════════════════════════════════════════════════════════
+# ON-DEMAND CA ANALYSIS
+# ══════════════════════════════════════════════════════════════════════════════
 
-    price_block = ""
-    if px and px.get("found"):
-        price_block = (
-            f"*Price:* {fmt_usd(px.get('price_usd'))}  "
-            f"MCap: {fmt_usd(px.get('mcap'))}\n"
-            f"*Volume 24h:* {fmt_usd(px.get('volume_24h'))}  "
-            f"Liq: {fmt_usd(px.get('liquidity'))}\n"
-            f"*Change:* 5m {fmt_pct(px.get('price_change_5m'))}  "
-            f"1h {fmt_pct(px.get('price_change_1h'))}  "
-            f"24h {fmt_pct(px.get('price_change_24h'))}\n\n"
-        )
+async def analyze_ca(update, mint: str, session_factory):
+    msg = await update.message.reply_text(f"⏳ Analyzing `{mint[:8]}...{mint[-4:]}`", parse_mode="Markdown")
+    try:
+        async with aiohttp.ClientSession() as session:
+            px, safety, holders, dev, smart = await asyncio.gather(
+                get_price_data(session, mint),
+                get_token_safety(session, mint),
+                get_holders(session, mint),
+                get_dev_info(session, mint),
+                check_smart_money(session, mint),
+            )
+            token = {
+                "mint": mint, "symbol": "", "name": "",
+                "launchpad": ("Manual", "🔍"), "source": "manual",
+            }
+            result = score_token(token, px, safety, holders, dev, smart)
+            score  = result["total"]
+            rug    = result["rug_risk"]
+            re_em  = {"low":"🟢","medium":"🟡","high":"🔴"}.get(rug,"⚪")
+            bd     = result["breakdown"]
+            mcap   = float(px.get("mcap") or 0)
+            liq    = float(px.get("liq_usd") or 0)
+            vol    = float(px.get("volume_24h") or 0)
+            bar    = "█" * round(score/10) + "░" * (10 - round(score/10))
 
-    return (
-        f"🚨 *AlphaScan Alert*\n\n"
-        f"*Launchpad:* {lp_emoji} {lp_name}\n"
-        f"*Token:* `{mint}`\n"
-        f"*Score:* {score}/99  `{bar}`\n"
-        f"*Conviction:* {conviction}\n"
-        f"{price_block}"
-        f"*Breakdown:*\n"
-        f"  🐋 Smart money:   {bd.get('smart_money',0)}/25\n"
-        f"  📊 Distribution:  {bd.get('distribution',0)}/20\n"
-        f"  🤖 Organic:       {bd.get('organic',0)}/20\n"
-        f"  ⚡ TX velocity:   {bd.get('tx_velocity',0)}/15\n"
-        f"  🔒 Authority:     {bd.get('authority',0)}/10\n"
-        f"  💧 Liquidity:     {bd.get('liquidity',0)}/10\n"
-        f"  🛡 Dev safety:    {bd.get('dev_safety',0)}/10\n"
-        f"  📈 Momentum:      {bd.get('momentum',0)}/10\n"
-        f"  📊 Vol/MCap:      {bd.get('vol_mcap_ratio',0)}/5\n"
-        f"  👥 Holders:       {bd.get('holder_count',0)}/3\n"
-        f"  🎓 Graduated:     {bd.get('graduation',0)}/2\n\n"
-        f"*Signals:*\n{boosts_txt}\n\n"
-        f"*Warnings:*\n{warnings_txt}\n\n"
-        f"*Safety:*\n"
-        f"  Mint authority: {'✅ Revoked' if auth.get('mint_revoked') else '🚨 Active'}\n"
-        f"  Freeze authority: {'✅ Revoked' if auth.get('freeze_revoked') else '🚨 Active'}\n"
-        f"  Liquidity: {liq.get('liquidity_tier','?')} ({liq.get('pool_pct','?')}% in pool)\n"
-        f"  Momentum: {mom.get('momentum','?')} — {mom.get('note','')}\n\n"
-        f"*Rug risk:* {re_emoji} {rug.upper()}\n"
-        f"Top holder: {h.get('top1_pct',0)}% | "
-        f"Holders: {h.get('count',0)} | "
-        f"TXs: {info.get('sigs_count',0)}\n\n"
-        f"🔗 [DexScreener](https://dexscreener.com/solana/{mint}) | "
-        f"[Birdeye](https://birdeye.so/token/{mint}?chain=solana) | "
-        f"[Solscan](https://solscan.io/token/{mint})\n\n"
-        f"_Scanned {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC_"
-    )
+            boosts_txt   = "\n".join(result["boosts"])   or "None"
+            warnings_txt = "\n".join(result["warnings"]) or "None"
 
-# ── Telegram commands ──────────────────────────────────────────────────────────
+            report = (
+                f"🔬 *Token Analysis*\n\n"
+                f"`{mint}`\n\n"
+                f"*Score:* {score}/99 `{bar}`\n"
+                f"*Verdict:* {result['conviction']}\n\n"
+                f"*Price:* ${px.get('price_usd','N/A')}  MCap: {fmt_usd(mcap)}\n"
+                f"*Volume:* {fmt_usd(vol)}  Liq: {fmt_usd(liq)}\n"
+                f"*Change:* 5m {fmt_pct(px.get('chg_5m',0))} | "
+                f"1h {fmt_pct(px.get('chg_1h',0))} | "
+                f"24h {fmt_pct(px.get('chg_24h',0))}\n\n"
+                f"*Breakdown:*\n"
+                f"  🔒 Authority:    {bd.get('authority',0)}/25\n"
+                f"  💧 Liquidity:    {bd.get('liquidity',0)}/20\n"
+                f"  📊 Distribution: {bd.get('distribution',0)}/15\n"
+                f"  📈 Momentum:     {bd.get('momentum',0)}/15\n"
+                f"  🔥 Vol/MCap:     {bd.get('vol_mcap',0)}/10\n"
+                f"  ⚡ TX Activity:  {bd.get('tx_activity',0)}/5\n"
+                f"  🛡 Dev safety:   {bd.get('dev_safety',0)}/5\n"
+                f"  🐋 Smart money:  {bd.get('smart_money',0)}/5\n"
+                f"  💬 Social:       {bd.get('social',0)}/3\n"
+                f"  🎯 MCap pos:     {bd.get('mcap_position',0)}/2\n\n"
+                f"*Safety:*\n"
+                f"  Mint auth: {'✅ Revoked' if safety.get('mint_revoked') else '🚨 Active'}\n"
+                f"  Freeze auth: {'✅ Revoked' if safety.get('freeze_revoked') else '🚨 Active'}\n"
+                f"  Top holder: {holders.get('real_top1_pct',0)}% {'(LP excl.)' if holders.get('lp_excluded') else ''}\n"
+                f"  Unique holders: {holders.get('count',0)}\n"
+                f"  Dev launches: {dev.get('launches',0)} | Wallet age: {dev.get('age_days',0)}d\n\n"
+                f"*✅ Signals:*\n{boosts_txt}\n\n"
+                f"*⚠️ Warnings:*\n{warnings_txt}\n\n"
+                f"*Rug risk:* {re_em} {rug.upper()}\n\n"
+                f"🔗 [DexScreener](https://dexscreener.com/solana/{mint}) | "
+                f"[Birdeye](https://birdeye.so/token/{mint}?chain=solana) | "
+                f"[Solscan](https://solscan.io/token/{mint})"
+            )
+            await msg.edit_text(report, parse_mode="Markdown", disable_web_page_preview=True)
+    except Exception as e:
+        log.error(f"analyze_ca {mint[:8]}: {e}")
+        await msg.edit_text(f"❌ Analysis failed: {str(e)[:100]}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN SCAN LOOP
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def scan_loop(bot: Bot):
+    last_summary_hour = -1
+    scan_count        = 0
+    log.info("Scan loop starting...")
+
+    async with aiohttp.ClientSession() as session:
+        while True:
+            scan_count += 1
+            log.info(f"═══ Scan #{scan_count} ═══")
+            try:
+                # Fetch all sources in parallel
+                pf_new, pf_trending, dex_new, dex_trending = await asyncio.gather(
+                    fetch_pumpfun_new(session),
+                    fetch_pumpfun_trending(session),
+                    fetch_dexscreener_new_pairs(session),
+                    fetch_dexscreener_trending(session),
+                )
+
+                # Deduplicate across sources, new launches take priority
+                candidates = {}
+                for t in pf_new + dex_new:
+                    if t["mint"] not in candidates:
+                        candidates[t["mint"]] = t
+                for t in pf_trending + dex_trending:
+                    if t["mint"] not in candidates:
+                        candidates[t["mint"]] = t
+
+                log.info(
+                    f"Sources: pf_new={len(pf_new)} pf_trend={len(pf_trending)} "
+                    f"dex_new={len(dex_new)} dex_trend={len(dex_trending)} "
+                    f"unique={len(candidates)}"
+                )
+
+                alerted = 0
+                for mint, token in candidates.items():
+                    if mint in seen_mints:
+                        continue
+                    seen_mints.add(mint)
+                    try:
+                        fired = await process_token(session, bot, token)
+                        if fired:
+                            alerted += 1
+                            await asyncio.sleep(2)
+                    except Exception as e:
+                        log.error(f"process_token {mint[:8]}: {e}")
+
+                # Housekeeping
+                await scan_watchlist(session, bot)
+                await check_copy_signals(bot)
+
+                if scan_count % 15 == 0:
+                    await check_performance(bot, session)
+
+                hour = datetime.now(timezone.utc).hour
+                if hour == 9 and last_summary_hour != 9:
+                    await send_daily_summary(bot)
+                    last_summary_hour = 9
+                elif hour != 9:
+                    last_summary_hour = hour
+
+                log.info(f"Scan #{scan_count} complete — {alerted} alerts, {len(seen_mints)} tokens seen")
+
+            except Exception as e:
+                log.error(f"Scan loop error: {e}")
+
+            await asyncio.sleep(SCAN_INTERVAL)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TELEGRAM COMMANDS
+# ══════════════════════════════════════════════════════════════════════════════
+
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 *AlphaScan Masterclass Commands:*\n\n"
-        "/threshold `<40-99>` — set alert threshold\n"
+        "👋 *AlphaScan.sol Commands:*\n\n"
+        "Paste any CA directly to analyze it\n\n"
+        "/threshold `<40-99>` — set alert threshold (default 55)\n"
         "/watch `<address>` `<label>` — track a wallet\n"
-        "/unwatch `<address>` — stop tracking wallet\n"
+        "/unwatch `<address>` — stop tracking\n"
         "/watchlist — show tracked wallets\n"
         "/addwallet `<address>` — add to smart money list\n"
+        "/blacklist `[address]` — view/add blacklist\n"
         "/summary — today's top tokens\n"
-        "/status — bot health & settings\n"
-        "/analyze `<CA>` — analyze any token on demand\n"
-        "Or just *paste any CA* directly into chat\n"
-        "/blacklist — view/add blacklisted deployers\n",
+        "/status — bot health & settings\n",
         parse_mode="Markdown"
     )
 
@@ -1538,11 +1041,11 @@ async def cmd_threshold(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global alert_threshold
     try:
         v = int(ctx.args[0])
-        if not 40 <= v <= 99: raise ValueError
+        if not 30 <= v <= 99: raise ValueError
         alert_threshold = v
-        await update.message.reply_text(f"✅ Threshold set to *{v}*", parse_mode="Markdown")
+        await update.message.reply_text(f"✅ Threshold set to *{v}*/99", parse_mode="Markdown")
     except (IndexError, ValueError):
-        await update.message.reply_text("Usage: /threshold 80 (must be 40–99)")
+        await update.message.reply_text("Usage: /threshold 55 (must be 30–99)")
 
 async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if len(ctx.args) < 2:
@@ -1550,19 +1053,19 @@ async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     addr, label = ctx.args[0], " ".join(ctx.args[1:])
     watchlist_wallets[addr] = label
-    await update.message.reply_text(f"👁 Watching *{label}*\n`{addr[:8]}...{addr[-4:]}`", parse_mode="Markdown")
+    await update.message.reply_text(f"👁 Watching *{label}*", parse_mode="Markdown")
 
 async def cmd_unwatch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     addr = ctx.args[0] if ctx.args else ""
     if addr in watchlist_wallets:
         watchlist_wallets.pop(addr)
-        await update.message.reply_text("✅ Removed from watchlist")
+        await update.message.reply_text("✅ Removed")
     else:
-        await update.message.reply_text("Wallet not found.")
+        await update.message.reply_text("Not found in watchlist")
 
 async def cmd_watchlist(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not watchlist_wallets:
-        await update.message.reply_text("No wallets tracked. Use /watch to add one.")
+        await update.message.reply_text("No wallets tracked. Use /watch to add.")
         return
     lines = ["👁 *Watchlist:*\n"] + [
         f"• *{label}*: `{addr[:8]}...{addr[-4:]}`"
@@ -1571,37 +1074,29 @@ async def cmd_watchlist(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def cmd_addwallet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Dynamically add a wallet to the smart money list."""
     if not ctx.args:
         await update.message.reply_text("Usage: /addwallet <address>")
         return
     addr = ctx.args[0]
-    SMART_MONEY_SEEDS.add(addr)
+    SMART_MONEY.add(addr)
     smart_wallet_db[addr] = {"added": datetime.now(timezone.utc).isoformat()}
     await update.message.reply_text(
-        f"🐋 Added to smart money list\n`{addr[:8]}...{addr[-4:]}`\n\n"
-        f"Bot will now alert when this wallet buys early.",
+        f"🐋 Added to smart money list\n`{addr[:8]}...{addr[-4:]}`",
         parse_mode="Markdown"
     )
 
-
 async def cmd_blacklist(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Show or manually add to the auto-blacklist."""
     if ctx.args:
-        addr = ctx.args[0]
-        blacklisted_devs.add(addr)
-        await update.message.reply_text(
-            f"🚫 Added to blacklist\n`{addr[:8]}...{addr[-4:]}`",
-            parse_mode="Markdown"
-        )
-    else:
-        if not blacklisted_devs:
-            await update.message.reply_text("Blacklist is empty — auto-populated as rugs are detected.")
-            return
-        lines = ["🚫 *Blacklisted deployers:*\n"]
-        for addr in list(blacklisted_devs)[:20]:
-            lines.append(f"• `{addr[:8]}...{addr[-4:]}`")
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        blacklisted_devs.add(ctx.args[0])
+        await update.message.reply_text(f"🚫 Blacklisted `{ctx.args[0][:8]}...`", parse_mode="Markdown")
+        return
+    if not blacklisted_devs:
+        await update.message.reply_text("Blacklist empty — auto-filled as rugs are detected.")
+        return
+    lines = ["🚫 *Blacklisted deployers:*\n"] + [
+        f"• `{addr[:8]}...{addr[-4:]}`" for addr in list(blacklisted_devs)[:20]
+    ]
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def cmd_summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await send_daily_summary(ctx.bot)
@@ -1611,207 +1106,36 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"⚙️ *AlphaScan Status*\n\n"
         f"Threshold: *{alert_threshold}/99*\n"
         f"Scan interval: *{SCAN_INTERVAL}s*\n"
-        f"Tokens seen: *{len(seen_mints)}*\n"
+        f"Tokens seen this session: *{len(seen_mints)}*\n"
         f"Alerts today: *{len(daily_top)}*\n"
         f"Watchlist: *{len(watchlist_wallets)}* wallets\n"
-        f"Smart money list: *{len(SMART_MONEY_SEEDS) + len(smart_wallet_db)}* wallets\n"
-        f"Tracking for performance: *{len(tracked_alerts)}* tokens\n\n"
-        f"*Signals active:*\n"
-        f"✅ Mint/freeze authority\n✅ Bundle detection\n"
-        f"✅ Dev rug history\n✅ Liquidity depth\n"
-        f"✅ Price momentum\n✅ Smart money\n"
-        f"✅ Holder distribution\n✅ TX velocity\n"
-        f"✅ Graduation tracking\n✅ DexScreener price data\n✅ Auto-blacklist ruggers\n✅ Multi-wallet copy signal\n",
+        f"Smart money: *{len(SMART_MONEY)}* wallets\n"
+        f"Blacklisted devs: *{len(blacklisted_devs)}*\n"
+        f"Tracking for 24h report: *{len(tracked_alerts)}*\n\n"
+        f"*Sources:* Pump.fun API ✅ | DexScreener ✅ | Helius RPC ✅\n"
+        f"*Signals:* Authority | Liquidity | Holders | Momentum | Vol/MCap | Dev | Smart Money | Social\n",
         parse_mode="Markdown"
     )
 
-# ── Main scan loop ─────────────────────────────────────────────────────────────
-async def scan_loop(bot: Bot):
-    last_summary_hour = -1
-    scan_count = 0
-    async with aiohttp.ClientSession() as session:
-        while True:
-            scan_count += 1
-            log.info(f"Scan #{scan_count}")
-            try:
-                new_mints = await fetch_new_tokens(session)
-                log.info(f"{len(new_mints)} new mints found")
-                alerted = 0
-                for mint, launchpad in new_mints:
-                    if mint in seen_mints:
-                        continue
-                    seen_mints.add(mint)
-                    info = await enrich_token(session, mint, launchpad)
-                    if not info:
-                        continue
-                    result = score_token(info)
-                    score  = result["total"]
-                    lp_name, _ = launchpad
-                    log.info(f"{mint[:8]} score={score} rug={result['rug_risk']} lp={lp_name} fail={result['hard_fail']}")
-                    if score >= alert_threshold and not result["hard_fail"]:
-                        await bot.send_message(
-                            chat_id=TELEGRAM_CHAT_ID,
-                            text=format_alert(mint, info, result),
-                            parse_mode="Markdown",
-                            disable_web_page_preview=True
-                        )
-                        tracked_alerts[mint] = {
-                            "score": score, "time": datetime.now(timezone.utc),
-                            "launchpad": launchpad, "reported": False
-                        }
-                        daily_top.append({"mint": mint, "score": score, "launchpad": launchpad})
-                        alerted += 1
-                        await asyncio.sleep(1.5)
-
-                await scan_watchlist(session, bot)
-                await check_copy_signals(bot)
-                if scan_count % 10 == 0:
-                    await check_performance(bot, session)
-
-                hour = datetime.now(timezone.utc).hour
-                if hour == 9 and last_summary_hour != 9:
-                    await send_daily_summary(bot)
-                    last_summary_hour = 9
-                elif hour != 9:
-                    last_summary_hour = hour
-
-                if not alerted:
-                    log.info("No alerts this scan")
-            except Exception as e:
-                log.error(f"Scan error: {e}")
-            await asyncio.sleep(SCAN_INTERVAL)
-
-# ── CA analysis — paste any token address ─────────────────────────────────────
 async def cmd_analyze(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Triggered by /analyze <CA> or by pasting a raw CA in chat."""
-    if ctx.args:
-        ca = ctx.args[0].strip()
-    else:
+    if not ctx.args:
         await update.message.reply_text("Usage: /analyze <token_address>")
         return
-    await run_analysis(update, ca)
+    await analyze_ca(update, ctx.args[0].strip(), None)
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Detect raw Solana CA pasted directly into chat and auto-analyze it."""
     text = (update.message.text or "").strip()
-    # Solana addresses are base58, 32-44 chars, no spaces
     if re.match(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$", text):
-        await update.message.reply_text(f"🔍 Analyzing `{text[:8]}...{text[-4:]}`", parse_mode="Markdown")
-        await run_analysis(update, text)
-
-async def run_analysis(update: Update, mint: str):
-    """Full 10-signal analysis on demand for any token CA."""
-    msg = await update.message.reply_text("⏳ Running full analysis — this takes ~10 seconds...")
-    try:
-        async with aiohttp.ClientSession() as session:
-            launchpad = ("Unknown", "⚪")
-            # Try to detect launchpad from mint tx history
-            sigs = await rpc(session, "getSignaturesForAddress", [mint, {"limit": 10}])
-            if sigs:
-                for s in sigs[:5]:
-                    tx = await rpc(session, "getTransaction", [
-                        s["signature"],
-                        {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}
-                    ])
-                    if not tx:
-                        continue
-                    keys = [
-                        a.get("pubkey","") if isinstance(a,dict) else str(a)
-                        for a in tx.get("transaction",{}).get("message",{}).get("accountKeys",[])
-                    ]
-                    lp = detect_launchpad(keys)
-                    if lp[0] != "Unknown":
-                        launchpad = lp
-                        break
-
-            info = await enrich_token(session, mint, launchpad)
-            if not info:
-                await msg.edit_text("❌ Could not fetch token data. Check the address and try again.")
-                return
-
-            result = score_token(info)
-            score  = result["total"]
-            rug    = result["rug_risk"]
-            re_emoji = {"low":"🟢","medium":"🟡","high":"🔴"}.get(rug,"⚪")
-            lp_name, lp_emoji = launchpad
-            bar = "█" * round(score/10) + "░" * (10 - round(score/10))
-            bd  = result["breakdown"]
-            auth = info.get("auth", {})
-            liq  = info.get("liquidity", {})
-            mom  = info.get("momentum", {})
-            h    = info.get("holders", {})
-            sm   = info.get("smart", {})
-            dev  = info.get("dev", {})
-
-            # Verdict
-            verdict = result.get("conviction", "❌ DO NOT BUY" if result["hard_fail"] else "🔴 AVOID")
-
-            boosts_txt   = "\n".join(result["boosts"])   or "None"
-            warnings_txt = "\n".join(result["warnings"]) or "None"
-
-            px = info.get("price", {})
-            price_block = ""
-            if px and px.get("found"):
-                price_block = (
-                    f"*Price:* {fmt_usd(px.get('price_usd'))}  "
-                    f"MCap: {fmt_usd(px.get('mcap'))}\n"
-                    f"*Volume 24h:* {fmt_usd(px.get('volume_24h'))}  "
-                    f"Liq: {fmt_usd(px.get('liquidity'))}\n"
-                    f"*Change:* 5m {fmt_pct(px.get('price_change_5m'))}  "
-                    f"1h {fmt_pct(px.get('price_change_1h'))}  "
-                    f"24h {fmt_pct(px.get('price_change_24h'))}\n\n"
-                )
-
-            report = (
-                f"🔬 *Token Analysis Report*\n\n"
-                f"*CA:* `{mint}`\n"
-                f"*Launchpad:* {lp_emoji} {lp_name}\n"
-                f"*Score:* {score}/99  `{bar}`\n"
-        f"*Conviction:* {conviction}\n"
-                f"{price_block}"
-                f"*Verdict:* {verdict}\n\n"
-                f"*Score breakdown:*\n"
-                f"  🐋 Smart money:   {bd.get('smart_money',0)}/25\n"
-                f"  📊 Distribution:  {bd.get('distribution',0)}/20\n"
-                f"  🤖 Organic:       {bd.get('organic',0)}/20\n"
-                f"  ⚡ TX velocity:   {bd.get('tx_velocity',0)}/15\n"
-                f"  🔒 Authority:     {bd.get('authority',0)}/10\n"
-                f"  💧 Liquidity:     {bd.get('liquidity',0)}/10\n"
-                f"  🛡 Dev safety:    {bd.get('dev_safety',0)}/10\n"
-                f"  📈 Momentum:      {bd.get('momentum',0)}/10\n"
-                f"  📊 Vol/MCap:      {bd.get('vol_mcap_ratio',0)}/5\n"
-                f"  👥 Holders:       {bd.get('holder_count',0)}/3\n"
-                f"  🎓 Graduated:     {bd.get('graduation',0)}/2\n\n"
-                f"*Safety checks:*\n"
-                f"  Mint authority:   {'✅ Revoked' if auth.get('mint_revoked') else '🚨 Still active'}\n"
-                f"  Freeze authority: {'✅ Revoked' if auth.get('freeze_revoked') else '🚨 Still active'}\n"
-                f"  Liquidity tier:   {liq.get('liquidity_tier','?')} ({liq.get('pool_pct','?')}% in pool)\n"
-                f"  Momentum:         {mom.get('momentum','?')} — {mom.get('note','')}\n\n"
-                f"*On-chain stats:*\n"
-                f"  Top holder: {h.get('top1_pct',0)}% of supply\n"
-                f"  Top 3 holders: {h.get('top3_pct',0)}% of supply\n"
-                f"  Unique holders: {h.get('count',0)}\n"
-                f"  Recent TXs: {info.get('sigs_count',0)}\n"
-                f"  Smart wallets in: {sm.get('count',0)}\n"
-                f"  Dev launches: {dev.get('launches',0)} (risk: {dev.get('risk','?')})\n\n"
-                f"*Green flags:*\n{boosts_txt}\n\n"
-                f"*Red flags:*\n{warnings_txt}\n\n"
-                f"*Rug risk:* {re_emoji} {rug.upper()}\n\n"
-                f"🔗 [DexScreener](https://dexscreener.com/solana/{mint}) | "
-                f"[Birdeye](https://birdeye.so/token/{mint}?chain=solana) | "
-                f"[Solscan](https://solscan.io/token/{mint})"
-            )
-            await msg.edit_text(report, parse_mode="Markdown", disable_web_page_preview=True)
-
-    except Exception as e:
-        log.error(f"run_analysis {mint[:8]}: {e}")
-        await msg.edit_text(f"❌ Analysis failed: {str(e)[:100]}")
+        await analyze_ca(update, text, None)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# BOOT
+# ══════════════════════════════════════════════════════════════════════════════
 
-# ── Boot ───────────────────────────────────────────────────────────────────────
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+
     for cmd, handler in [
         ("start",     cmd_start),
         ("threshold", cmd_threshold),
@@ -1819,10 +1143,10 @@ def main():
         ("unwatch",   cmd_unwatch),
         ("watchlist", cmd_watchlist),
         ("addwallet", cmd_addwallet),
+        ("blacklist", cmd_blacklist),
         ("summary",   cmd_summary),
         ("status",    cmd_status),
         ("analyze",   cmd_analyze),
-        ("blacklist",  cmd_blacklist),
     ]:
         app.add_handler(CommandHandler(cmd, handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
@@ -1833,16 +1157,22 @@ def main():
         await app.bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
             text=(
-                f"✅ AlphaScan Masterclass is live!\n\n"
-                f"10 signals active. Threshold: {alert_threshold}/99\n"
-                f"Scan every {SCAN_INTERVAL//60}min\n\n"
-                f"New: /addwallet to build your smart money list\n"
+                f"✅ AlphaScan.sol — FULL REBUILD LIVE\n\n"
+                f"Sources: Pump.fun API + DexScreener + Helius\n"
+                f"Threshold: {alert_threshold}/99\n"
+                f"Scan every {SCAN_INTERVAL}s\n\n"
+                f"Paste any CA directly to analyze it\n"
                 f"Type /start for all commands"
             )
         )
-        await asyncio.gather(scan_loop(app.bot), app.updater.start_polling())
+        await asyncio.gather(
+            scan_loop(app.bot),
+            app.updater.start_polling()
+        )
 
     asyncio.run(run())
 
 if __name__ == "__main__":
     main()
+ENDOFBOT
+echo "Written — $(wc -l < /home/claude/alphascan-bot/bot.py) lines"
