@@ -206,6 +206,11 @@ async def check_holders(session, mint: str) -> dict:
             r["real_top1_pct"] = round(real[0] / total * 100, 1) if real else r["top1_pct"]
         else:
             r["real_top1_pct"] = r["top1_pct"]
+
+        # Extra insider check: if top 3 non-LP holders own >60% combined = insider
+        non_lp_amounts = amounts[1:] if r["lp_excluded"] else amounts
+        top3_non_lp = sum(non_lp_amounts[:3]) / total * 100 if total > 0 else 0
+        r["insider_pct"] = round(top3_non_lp, 1)
     except Exception as e:
         log.debug(f"Holders {mint[:8]}: {e}")
     return r
@@ -373,7 +378,7 @@ async def update_winner_watch(session, mint: str, px: dict, sigs: list):
         entry["promoted"] = True
 
 # ── Full token enrichment ──────────────────────────────────────────────────────
-async def enrich_token(session, mint: str, launchpad: tuple) -> dict | None:
+async def enrich_token(session, mint: str, launchpad: tuple, source: str = "") -> dict | None:
     try:
         px = await fetch_price(session, mint)
         sigs_res, acct_res = await asyncio.gather(
@@ -423,6 +428,7 @@ async def enrich_token(session, mint: str, launchpad: tuple) -> dict | None:
             "name":      name,
             "symbol":    symbol,
             "launchpad": launchpad,
+            "source":    source,
             "deployer":  deployer,
             "age_mins":  age_mins,
             "px":        px,
@@ -477,6 +483,11 @@ def score_token(info: dict) -> dict:
     else:                hd = 0;  warnings.append(f"🚨 Top holder {real_top1}% — rug risk")
     if h.get("lp_excluded"):
         boosts.append(f"📊 LP excluded, real top: {real_top1}%")
+    insider = h.get("insider_pct", 0)
+    if insider > 40:
+        warnings.append(f"🚨 Insider concentration: top 3 non-LP wallets own {insider}%")
+    elif insider > 25:
+        warnings.append(f"⚠️ Moderate insider holding: {insider}%")
     score += hd; bd["distribution"] = hd
 
     # ── 3. Organic launch / anti-bundle (15 pts) ──────────────────────────────
@@ -584,10 +595,20 @@ def score_token(info: dict) -> dict:
     # Always fail
     if real_top1 > 50:
         hard_fail = True; fail_reasons.append(f"top holder {real_top1}% (excl LP)")
+    insider_pct = h.get("insider_pct", 0)
+    if insider_pct > 60:
+        hard_fail = True; fail_reasons.append(f"insider concentration {insider_pct}% (top 3 non-LP holders)")
     if info.get("deployer","") in blacklisted_devs:
         hard_fail = True; fail_reasons.append("blacklisted deployer")
     if b.get("is_bundled") and sm.get("count", 0) == 0:
         hard_fail = True; fail_reasons.append("bundled + zero smart money")
+
+    # MCap ceiling — never alert on anything already above $5M
+    # (unless it's a new launch under 30 min old)
+    px_mcap = info.get("px", {}).get("mcap", 0) or 0
+    source  = info.get("source", "")
+    if px_mcap > 5_000_000 and not is_new:
+        hard_fail = True; fail_reasons.append(f"mcap {fmt_usd(px_mcap)} too high for momentum alert")
 
     # Only fail on established tokens (>30 min)
     if not is_new:
@@ -745,58 +766,128 @@ async def scanner1_launches(session) -> list:
 # ══════════════════════════════════════════════════════════════════════════════
 async def scanner2_momentum(session) -> list:
     """
-    Watch Raydium swap activity. Track tokens appearing repeatedly across
-    scan cycles — accelerating activity = momentum.
+    Watch Pump.fun, PumpSwap, LetsBonk and Raydium for momentum.
+    STRICT pre-screening: size ceiling, liquidity cap, dump filter.
+    Root cause fix: uses liquidity as proxy when mcap=0/null so large
+    established tokens can never slip through the size gate.
     """
-    found = []
-    STABLES = {
+    # ── Always skip — stablecoins + known large-cap Solana tokens ─────────────
+    SKIP_MINTS = {
         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
         "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",   # USDT
         "So11111111111111111111111111111111111111112",     # wSOL
         "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
+        "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",   # mSOL
+        "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs",  # ETH
+        "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",   # JUP
+        "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R",  # RAY
+        "orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE",   # ORCA
+        "WnFt12ZrnzZrFZkt2xsNsaNWoQribnuQ5B5FrDbwDhD",   # WIF
+        "HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3",  # PYTH
+        "MangoCzJ36AjZyKwVj3VnYU4GTonjfVEnJmvvWaxLac",   # MNGO
+        "bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1",   # bSOL
+        "7i5KKsX2weiTkry7jA4ZwSuXGhs5eJBEjY8vVxR4pfRx",  # GMT
+        "StepAscQoEioFxxWGnh2sLBDFp9d8rvKz2Yp39iDpyT",   # STEP
+        "4vMsoUT2BWatFweudnQM1xedRLfJgJ7hswhcpz4xgBTy",  # HADES
+        "HxhWkVpk5NS4Ltg5nij2G671CKXFRKPK8vy271Ub4uEK",  # HXRO
     }
-    try:
-        sigs = await rpc(session, "getSignaturesForAddress", [RAYDIUM_AMM, {"limit": 60}])
-        token_hits = defaultdict(int)
-        for s in (sigs or [])[:30]:
-            try:
-                tx = await rpc(session, "getTransaction", [
-                    s["signature"],
-                    {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}
-                ])
-                if not tx: continue
-                for bal in tx.get("meta", {}).get("postTokenBalances", []):
-                    mint = bal.get("mint")
-                    if mint and mint not in STABLES and mint not in seen_mints:
-                        token_hits[mint] += 1
-            except: continue
 
-        now = datetime.now(timezone.utc)
-        for mint, hits in token_hits.items():
-            if hits < 2: continue
-            if mint not in momentum_tracker:
-                momentum_tracker[mint] = {"samples": [], "first_seen": now}
-            entry = momentum_tracker[mint]
-            entry["samples"].append({"hits": hits, "time": now})
-            entry["samples"] = entry["samples"][-8:]
-            if len(entry["samples"]) < 2: continue
-            prev = entry["samples"][-2]["hits"]
-            curr = entry["samples"][-1]["hits"]
-            if curr >= prev * 1.8 and curr >= 3:
-                lp = ("Raydium", "🔵")
-                found.append((mint, lp, "momentum", f"activity {prev}→{curr} txs"))
-                log.info(f"Scanner2 momentum: {mint[:8]} ({prev}→{curr})")
-    except Exception as e:
-        log.warning(f"Scanner2: {e}")
-    return found[:8]
+    DEX_PROGRAMS = [
+        (PUMPFUN_PROGRAM,  "Pump.fun",     "🟢"),
+        (PUMPSWAP_PROGRAM, "PumpSwap",     "🎓"),
+        (LETSBONK_PROGRAM, "LetsBonk.fun", "🟡"),
+        (RAYDIUM_AMM,      "Raydium",      "🔵"),
+    ]
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SCANNER 3 — DexScreener trending with 6-gate filter
-# ══════════════════════════════════════════════════════════════════════════════
-MAX_MCAP    = float(os.environ.get("TRENDING_MAX_MCAP",    "5000000"))
-MIN_LIQ     = float(os.environ.get("TRENDING_MIN_LIQ",     "8000"))
-MAX_PUMP_1H = float(os.environ.get("TRENDING_MAX_PUMP_1H", "500"))
-MIN_VOL     = float(os.environ.get("TRENDING_MIN_VOL",     "3000"))
+    token_hits = defaultdict(lambda: {"count": 0, "launchpad": ("Unknown", "⚪")})
+    now        = datetime.now(timezone.utc)
+
+    for prog, lp_name, lp_emoji in DEX_PROGRAMS:
+        try:
+            sigs = await rpc(session, "getSignaturesForAddress", [prog, {"limit": 40}])
+            for s in (sigs or [])[:20]:
+                try:
+                    tx = await rpc(session, "getTransaction", [
+                        s["signature"],
+                        {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}
+                    ])
+                    if not tx: continue
+                    for bal in tx.get("meta", {}).get("postTokenBalances", []):
+                        mint = bal.get("mint")
+                        if not mint or mint in SKIP_MINTS or mint in seen_mints:
+                            continue
+                        token_hits[mint]["count"]    += 1
+                        token_hits[mint]["launchpad"] = (lp_name, lp_emoji)
+                except: continue
+        except Exception as e:
+            log.debug(f"Scanner2 {lp_name}: {e}")
+
+    candidates = []
+    for mint, data in token_hits.items():
+        hits = data["count"]
+
+        # Momentum must be accelerating across scans
+        if mint not in momentum_tracker:
+            momentum_tracker[mint] = {"samples": [], "first_seen": now}
+        entry = momentum_tracker[mint]
+        entry["samples"].append({"hits": hits, "time": now})
+        entry["samples"] = entry["samples"][-8:]
+        if len(entry["samples"]) < 2:
+            continue
+        prev = entry["samples"][-2]["hits"]
+        curr = entry["samples"][-1]["hits"]
+        if not (curr >= prev * 1.5 and curr >= 3):
+            continue
+
+        # ── DexScreener strict gate — no exceptions ───────────────────────────
+        px = await fetch_price(session, mint)
+
+        if px.get("found"):
+            mcap   = float(px.get("mcap",       0) or 0)
+            liq    = float(px.get("liquidity",  0) or 0)
+            chg_1h = float(px.get("chg_1h",     0) or 0)
+            chg_24h= float(px.get("chg_24h",    0) or 0)
+            vol    = float(px.get("volume_24h", 0) or 0)
+
+            # THE ROOT CAUSE FIX:
+            # DexScreener sometimes returns mcap=0 even for $500M tokens
+            # when the fdv/marketCap fields are null. Use liquidity * 10 as
+            # a conservative size proxy — $500K liq = ~$5M mcap minimum.
+            effective_mcap = mcap if mcap > 0 else (liq * 10)
+
+            if effective_mcap > 5_000_000:
+                log.debug(f"S2 skip {mint[:8]}: size ~${effective_mcap/1e6:.1f}M")
+                continue
+
+            # Additional established-token guard: >$500K liquidity = not a memecoin play
+            if liq > 500_000:
+                log.debug(f"S2 skip {mint[:8]}: liq ${liq/1e3:.0f}K — established")
+                continue
+
+            if chg_24h > 800:
+                log.debug(f"S2 skip {mint[:8]}: already +{chg_24h:.0f}% 24h")
+                continue
+
+            if chg_1h < -35:
+                log.debug(f"S2 skip {mint[:8]}: dumping {chg_1h:.0f}% 1h")
+                continue
+
+            if vol < 500 and mcap > 50_000:
+                log.debug(f"S2 skip {mint[:8]}: ghost — no volume")
+                continue
+
+        else:
+            # No DexScreener data = brand new token (good) OR unlisted junk
+            # Require higher hit count to trust no-data tokens
+            if curr < 5:
+                log.debug(f"S2 skip {mint[:8]}: no dex data, only {curr} hits")
+                continue
+
+        reason = f"momentum {prev}→{curr} txs | {data['launchpad'][0]}"
+        candidates.append((mint, data["launchpad"], "momentum", reason))
+        log.info(f"S2 ✓ {mint[:8]} — {reason}")
+
+    return candidates[:6]
 
 async def scanner3_trending(session) -> list:
     found = []
@@ -854,7 +945,7 @@ async def scanner3_trending(session) -> list:
 # ── Process a single token through scoring and alert ──────────────────────────
 async def process_token(session, bot: Bot, mint: str, launchpad: tuple,
                         source: str, extra_note: str = "") -> bool:
-    info = await enrich_token(session, mint, launchpad)
+    info = await enrich_token(session, mint, launchpad, source)
     if not info: return False
     result = score_token(info)
     score  = result["total"]
