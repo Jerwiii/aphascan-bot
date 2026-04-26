@@ -60,7 +60,8 @@ user_smart_wallets = set(os.environ.get("SMART_WALLETS", "").split(",")) - {""}
 # Auto-discovered wallets (engine populates this)
 discovered_smart_wallets = {}  # addr -> {wins, seen_on: [mints], promoted_at}
 # Tokens to watch for 3x to discover new smart wallets
-winner_watch = {}  # mint -> {entry_price, buyers: [], first_seen}
+winner_watch      = {}  # mint -> {entry_price, buyers: [], first_seen}
+take_profit_watch = {}  # mint -> {entry_mcap, name, symbol, tp2x, tp5x, ath, notified}
 
 def all_smart_wallets() -> set:
     return SMART_WALLET_SEEDS | user_smart_wallets | set(discovered_smart_wallets.keys())
@@ -84,8 +85,8 @@ async def fetch_price(session, mint: str) -> dict:
     cached = price_cache.get(mint)
     if cached and (datetime.now(timezone.utc) - cached["fetched_at"]).total_seconds() < 45:
         return cached["data"]
-    result = {"found": False, "price_usd": None, "mcap": None, "liquidity": None,
-              "volume_24h": None, "chg_5m": None, "chg_1h": None, "chg_24h": None}
+    result = {"found": False, "name": "", "symbol": "", "price_usd": None, "mcap": None,
+              "liquidity": None, "volume_24h": None, "chg_5m": None, "chg_1h": None, "chg_24h": None}
     try:
         async with session.get(
             f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
@@ -101,6 +102,8 @@ async def fetch_price(session, mint: str) -> dict:
             p = pairs[0]
             result = {
                 "found":      True,
+                "name":       p.get("baseToken", {}).get("name", ""),
+                "symbol":     p.get("baseToken", {}).get("symbol", ""),
                 "price_usd":  p.get("priceUsd"),
                 "mcap":       float(p.get("fdv") or p.get("marketCap") or 0),
                 "liquidity":  float(p.get("liquidity", {}).get("usd") or 0),
@@ -116,6 +119,42 @@ async def fetch_price(session, mint: str) -> dict:
         log.debug(f"DexScreener {mint[:8]}: {e}")
     return result
 
+
+
+# ── Token name resolver ────────────────────────────────────────────────────────
+async def get_token_name(session, mint: str, px: dict) -> tuple:
+    """
+    Returns (name, symbol) for a token.
+    Priority: DexScreener (already fetched) → Helius DAS getAsset → on-chain metadata
+    """
+    # 1. Already have it from DexScreener
+    if px.get("name") or px.get("symbol"):
+        name   = px.get("name", "")
+        symbol = px.get("symbol", "")
+        if name or symbol:
+            return name, symbol
+
+    # 2. Try Helius DAS getAsset — richest metadata source
+    try:
+        async with session.post(
+            HELIUS_RPC,
+            json={"jsonrpc": "2.0", "id": 1, "method": "getAsset", "params": {"id": mint}},
+            timeout=aiohttp.ClientTimeout(total=8)
+        ) as r:
+            d = await r.json()
+            asset = d.get("result", {})
+            if asset:
+                content  = asset.get("content", {})
+                metadata = content.get("metadata", {})
+                name   = metadata.get("name", "")
+                symbol = metadata.get("symbol", "")
+                if name or symbol:
+                    return name.strip(), symbol.strip()
+    except Exception as e:
+        log.debug(f"DAS getAsset {mint[:8]}: {e}")
+
+    # 3. Fallback: short address label
+    return f"Token {mint[:6]}...", mint[:6].upper()
 
 def fmt_usd(v) -> str:
     try:
@@ -354,6 +393,7 @@ async def enrich_token(session, mint: str, launchpad: tuple) -> dict | None:
             check_smart_money(session, mint, sigs),
             check_dev(session, deployer),
         )
+        name, symbol = await get_token_name(session, mint, px)
 
         bundle = detect_bundling(sigs[:50])
 
@@ -380,6 +420,8 @@ async def enrich_token(session, mint: str, launchpad: tuple) -> dict | None:
 
         return {
             "mint":      mint,
+            "name":      name,
+            "symbol":    symbol,
             "launchpad": launchpad,
             "deployer":  deployer,
             "age_mins":  age_mins,
@@ -595,6 +637,9 @@ def format_alert(mint: str, info: dict, result: dict, source: str = "") -> str:
     rug    = result["rug_risk"]
     re_e   = {"low":"🟢","medium":"🟡","high":"🔴"}.get(rug,"⚪")
     lp_name, lp_emoji = info.get("launchpad", ("Unknown","⚪"))
+    token_name   = info.get("name", "")
+    token_symbol = info.get("symbol", "")
+    token_label  = f"*{token_symbol}* — {token_name}" if token_symbol else f"`{mint[:8]}...{mint[-4:]}`"
     bar    = "█" * round(score/10) + "░" * (10 - round(score/10))
     bd     = result["breakdown"]
     px     = info.get("px", {})
@@ -624,8 +669,9 @@ def format_alert(mint: str, info: dict, result: dict, source: str = "") -> str:
     return (
         f"🚨 *AlphaScan Alert*\n"
         f"{src_tag}\n\n"
+        f"*Token:* {token_label}\n"
+        f"`{mint}`\n"
         f"*Launchpad:* {lp_emoji} {lp_name}  |  Age: {age_str}\n"
-        f"*Token:* `{mint}`\n"
         f"*Score:* {score}/99  `{bar}`\n"
         f"*Conviction:* {result['conviction']}\n\n"
         f"{price_block}"
@@ -825,10 +871,103 @@ async def process_token(session, bot: Bot, mint: str, launchpad: tuple,
         "score": score, "time": datetime.now(timezone.utc),
         "launchpad": launchpad, "source": source, "reported": False
     }
-    daily_top.append({"mint": mint, "score": score, "launchpad": launchpad})
+    # Register for take profit tracking
+    px_now = info.get("px", {})
+    take_profit_watch[mint] = {
+        "entry_mcap":  px_now.get("mcap", 0) or 0,
+        "name":        info.get("name", ""),
+        "symbol":      info.get("symbol", ""),
+        "ath":         px_now.get("mcap", 0) or 0,
+        "first_seen":  datetime.now(timezone.utc),
+        "dead":        False,
+    }
+    daily_top.append({"mint": mint, "score": score, "launchpad": launchpad,
+                      "name": info.get("name",""), "symbol": info.get("symbol","")})
     if mint in trending_tracker:
         trending_tracker[mint]["alerted"] = True
     return True
+
+
+# ── Take profit alert system ───────────────────────────────────────────────────
+async def check_take_profits(bot: Bot, session):
+    """
+    After every alert, track the token's MCap.
+    Fire specific alerts at: 2x, 5x, 10x, and -30% from ATH (protect gains).
+    """
+    if not take_profit_watch:
+        return
+    for mint, data in list(take_profit_watch.items()):
+        if data.get("dead"):
+            continue
+        try:
+            px = await fetch_price(session, mint)
+            if not px.get("found"):
+                continue
+            current_mcap = px.get("mcap", 0) or 0
+            if current_mcap <= 0:
+                continue
+            entry_mcap = data.get("entry_mcap", current_mcap)
+            if entry_mcap <= 0:
+                continue
+
+            multiplier = current_mcap / entry_mcap
+            ath        = data.get("ath", current_mcap)
+            name       = data.get("name", "")
+            symbol     = data.get("symbol", "")
+            label      = f"*{symbol}*" if symbol else f"`{mint[:8]}...`"
+
+            # Update ATH
+            if current_mcap > ath:
+                take_profit_watch[mint]["ath"] = current_mcap
+                ath = current_mcap
+
+            # ATH pullback alert (protect gains)
+            ath_drop_pct = ((ath - current_mcap) / ath * 100) if ath > 0 else 0
+            if ath_drop_pct >= 30 and not data.get("notified_ath_drop") and multiplier > 1.5:
+                take_profit_watch[mint]["notified_ath_drop"] = True
+                await bot.send_message(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    text=(
+                        f"⚠️ *ATH Pullback — Protect Gains*\n\n"
+                        f"{label} is down *{ath_drop_pct:.0f}%* from ATH\n"
+                        f"ATH MCap: {fmt_usd(ath)}\n"
+                        f"Now: {fmt_usd(current_mcap)} ({multiplier:.1f}x from entry)\n\n"
+                        f"Consider taking profits or moving stop.\n"
+                        f"🔗 [DexScreener](https://dexscreener.com/solana/{mint})"
+                    ),
+                    parse_mode="Markdown", disable_web_page_preview=True
+                )
+
+            # Milestone alerts
+            milestones = [
+                (2.0,  "tp2x",  "🎯 *2x HIT*",       "Consider taking 30-50% off"),
+                (5.0,  "tp5x",  "🚀 *5x HIT*",        "Strong take profit zone"),
+                (10.0, "tp10x", "💎 *10x HIT — RARE*","Take serious profits now"),
+            ]
+            for mult, flag, title, advice in milestones:
+                if multiplier >= mult and not data.get(f"notified_{flag}"):
+                    take_profit_watch[mint][f"notified_{flag}"] = True
+                    await bot.send_message(
+                        chat_id=TELEGRAM_CHAT_ID,
+                        text=(
+                            f"{title}\n\n"
+                            f"{label}\n"
+                            f"Entry MCap: {fmt_usd(entry_mcap)}\n"
+                            f"Now: {fmt_usd(current_mcap)} (*{multiplier:.1f}x*)\n\n"
+                            f"💡 {advice}\n\n"
+                            f"🔗 [DexScreener](https://dexscreener.com/solana/{mint})"
+                        ),
+                        parse_mode="Markdown", disable_web_page_preview=True
+                    )
+                    await asyncio.sleep(0.5)
+
+            # Mark dead if no DexScreener data for 4h+ and was alerted
+            age_hours = (datetime.now(timezone.utc) - data["first_seen"]).total_seconds() / 3600
+            if age_hours > 4 and not px.get("found"):
+                take_profit_watch[mint]["dead"] = True
+
+        except Exception as e:
+            log.debug(f"TP check {mint[:8]}: {e}")
 
 # ── Copy signal checker ────────────────────────────────────────────────────────
 async def check_copy_signals(bot: Bot):
@@ -891,9 +1030,12 @@ async def check_performance(bot: Bot, session):
             else:
                 verdict, emoji = ("Still active" if txs > 20 else "Likely dead"), ("🟡" if txs > 20 else "🔴")
             lp_name, lp_emoji = data.get("launchpad", ("?","⚪"))
+            tp_data = take_profit_watch.get(mint, {})
+            sym = tp_data.get("symbol","")
+            token_label_24h = f"*{sym}*  `{mint[:8]}...`" if sym else f"`{mint[:8]}...{mint[-4:]}`"
             await bot.send_message(
                 chat_id=TELEGRAM_CHAT_ID,
-                text=(f"📊 *24h Report*\n\n{emoji} `{mint[:8]}...{mint[-4:]}`\n"
+                text=(f"📊 *24h Report*\n\n{emoji} {token_label_24h}\n"
                       f"{lp_emoji} {lp_name}  |  Alert score: *{data['score']}*\n\n"
                       f"{verdict}\n24h TXs: {txs}\n\n"
                       f"🔗 [DexScreener](https://dexscreener.com/solana/{mint})"),
@@ -913,7 +1055,9 @@ async def send_daily_summary(bot: Bot):
     lines = ["📋 *AlphaScan Daily Top*\n"]
     for i, t in enumerate(top5, 1):
         lp_name, lp_emoji = t.get("launchpad", ("?","⚪"))
-        lines.append(f"{i}. `{t['mint'][:8]}...` Score *{t['score']}* {lp_emoji} {lp_name}")
+        sym = t.get("symbol","")
+        label = f"*{sym}*" if sym else f"`{t['mint'][:8]}...`"
+        lines.append(f"{i}. {label} Score *{t['score']}* {lp_emoji} {lp_name}")
         lines.append(f"   https://dexscreener.com/solana/{t['mint']}")
     lines.append(f"\n_Total alerts: {len(daily_top)}_")
     await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="\n".join(lines),
@@ -955,6 +1099,7 @@ async def cmd_start(u, ctx):
     await u.message.reply_text(
         "👋 *AlphaScan Commands:*\n\n"
         "Just *paste any CA* to analyze it\n\n"
+        "/tracking — tokens being monitored for take profits\n"
         "/threshold `<40-99>` — alert threshold\n"
         "/watch `<addr>` `<label>` — track wallet\n"
         "/unwatch `<addr>` — stop tracking\n"
@@ -1044,6 +1189,27 @@ async def cmd_status(u, ctx):
         parse_mode="Markdown"
     )
 
+
+async def cmd_tracking(u, ctx):
+    """Show all tokens currently being tracked for take profits."""
+    active = {m: d for m, d in take_profit_watch.items() if not d.get("dead")}
+    if not active:
+        await u.message.reply_text("No tokens currently tracked for take profits.")
+        return
+    lines = [f"📈 *Take Profit Tracking ({len(active)} tokens)*\n"]
+    for mint, d in list(active.items())[:10]:
+        sym   = d.get("symbol", "")
+        label = f"*{sym}*" if sym else f"`{mint[:8]}...`"
+        entry = d.get("entry_mcap", 0)
+        ath   = d.get("ath", entry)
+        notified = []
+        if d.get("notified_tp2x"):  notified.append("2x✓")
+        if d.get("notified_tp5x"):  notified.append("5x✓")
+        if d.get("notified_tp10x"): notified.append("10x✓")
+        n_str = " ".join(notified) if notified else "watching"
+        lines.append(f"• {label} — Entry: {fmt_usd(entry)} | ATH: {fmt_usd(ath)} | {n_str}")
+    await u.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
 async def cmd_analyze(u, ctx):
     if not ctx.args: await u.message.reply_text("Usage: /analyze <CA>"); return
     await run_analysis(u, ctx.args[0].strip())
@@ -1095,6 +1261,7 @@ async def scan_loop(bot: Bot):
 
                 await scan_watchlist(session, bot)
                 await check_copy_signals(bot)
+                await check_take_profits(bot, session)
 
                 if scan_count % 12 == 0:
                     await check_performance(bot, session)
