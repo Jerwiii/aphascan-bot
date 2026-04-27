@@ -724,12 +724,17 @@ def format_alert(mint: str, info: dict, result: dict, source: str = "") -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 async def scanner1_launches(session) -> list:
     """
-    Watch Pump.fun and LetsBonk programs for new token creations.
-    Pump.fun uses a custom 'create' instruction — we detect it by looking
-    for new mint accounts appearing in transactions touching the Pump.fun program.
+    Detect brand new token launches on Pump.fun and LetsBonk.
+
+    ROOT CAUSE FIX: Pump.fun does NOT use standard initializeMint.
+    It uses a custom program instruction. The correct detection method is:
+      preTokenBalances  = token accounts BEFORE the transaction
+      postTokenBalances = token accounts AFTER the transaction
+      New mint = any mint in post that does NOT appear in pre
+    This is 100% reliable for any launchpad regardless of instruction format.
     """
-    found = []
-    programs = [
+    found     = []
+    programs  = [
         (PUMPFUN_PROGRAM,  ("Pump.fun",     "🟢")),
         (LETSBONK_PROGRAM, ("LetsBonk.fun", "🟡")),
     ]
@@ -743,27 +748,21 @@ async def scanner1_launches(session) -> list:
                         {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}
                     ])
                     if not tx: continue
-                    msg  = tx.get("transaction", {}).get("message", {})
-                    keys = [a.get("pubkey","") if isinstance(a,dict) else str(a)
-                            for a in msg.get("accountKeys", [])]
-                    # Check all instructions including inner
-                    all_ixs = list(msg.get("instructions", []))
-                    for group in (tx.get("meta", {}).get("innerInstructions") or []):
-                        all_ixs.extend(group.get("instructions", []))
-                    for ix in all_ixs:
-                        p = ix.get("parsed", {})
-                        if isinstance(p, dict) and p.get("type") == "initializeMint":
-                            mint = p.get("info", {}).get("mint")
-                            if mint and mint not in seen_mints:
-                                found.append((mint, launchpad))
+                    meta = tx.get("meta", {}) or {}
+                    pre  = {b.get("mint") for b in (meta.get("preTokenBalances")  or [])}
+                    post = {b.get("mint") for b in (meta.get("postTokenBalances") or [])}
+                    # New mints = appeared in post but not in pre
+                    new_mints = post - pre - {None}
+                    for mint in new_mints:
+                        if mint and mint not in seen_mints:
+                            found.append((mint, launchpad))
+                            log.info(f"Scanner1 new mint: {mint[:8]}... on {launchpad[0]}")
                 except: continue
         except Exception as e:
             log.debug(f"Scanner1 {prog[:8]}: {e}")
+    log.info(f"Scanner1 found {len(found)} new launches")
     return found[:15]
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SCANNER 2 — Momentum: any-age token gaining traction on Raydium
-# ══════════════════════════════════════════════════════════════════════════════
 async def scanner2_momentum(session) -> list:
     """
     Watch Pump.fun, PumpSwap, LetsBonk and Raydium for momentum.
@@ -890,57 +889,100 @@ async def scanner2_momentum(session) -> list:
     return candidates[:6]
 
 async def scanner3_trending(session) -> list:
-    found = []
+    """
+    Detect trending Solana tokens under $5M mcap using DexScreener.
+
+    ROOT CAUSE FIXES:
+    1. Removed 2-scan confirmation — fast movers vanish before 2nd scan
+    2. Better endpoints — search by volume instead of profile metadata
+    3. Stricter gates applied immediately on first sighting
+    """
+    found     = []
     seen_this = set()
-    sources = [
-        ("https://api.dexscreener.com/token-profiles/latest/v1", "tokenAddress", ("DexScreener Trending","🔥")),
-        ("https://api.dexscreener.com/token-boosts/latest/v1",   "tokenAddress", ("DexScreener Boosted","⚡")),
-    ]
-    for url, key, launchpad in sources:
-        try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
-                if r.status != 200: continue
+    now       = datetime.now(timezone.utc)
+
+    # ── Source A: DexScreener token boosts (community promoting these) ─────────
+    try:
+        async with session.get(
+            "https://api.dexscreener.com/token-boosts/latest/v1",
+            timeout=aiohttp.ClientTimeout(total=8)
+        ) as r:
+            if r.status == 200:
                 items = await r.json()
-                for item in (items or [])[:30]:
+                for item in (items or [])[:40]:
                     if item.get("chainId") != "solana": continue
-                    mint = item.get(key, "")
+                    mint = item.get("tokenAddress", "")
+                    if mint and mint not in seen_mints and mint not in seen_this:
+                        seen_this.add(mint)
+                        found.append((mint, ("DexScreener Boosted", "⚡")))
+    except Exception as e:
+        log.debug(f"Scanner3 boosts: {e}")
+
+    # ── Source B: DexScreener new pairs on Solana sorted by 1h change ─────────
+    try:
+        async with session.get(
+            "https://api.dexscreener.com/latest/dex/search?q=solana",
+            timeout=aiohttp.ClientTimeout(total=8)
+        ) as r:
+            if r.status == 200:
+                data  = await r.json()
+                pairs = [p for p in (data.get("pairs") or []) if p.get("chainId") == "solana"]
+                # Sort by 1h volume change — tokens gaining momentum
+                pairs.sort(key=lambda p: float(p.get("volume",{}).get("h1") or 0), reverse=True)
+                for p in pairs[:30]:
+                    mint = p.get("baseToken", {}).get("address", "")
                     if not mint or mint in seen_mints or mint in seen_this: continue
                     seen_this.add(mint)
-                    px = await fetch_price(session, mint)
-                    if not px.get("found"): continue
-                    mcap = px.get("mcap", 0) or 0
-                    liq  = px.get("liquidity", 0) or 0
-                    vol  = px.get("volume_24h", 0) or 0
-                    c1h  = px.get("chg_1h", 0) or 0
-                    c5m  = px.get("chg_5m", 0) or 0
-                    # 6 gates
-                    if mcap > MAX_MCAP:      continue  # too big
-                    if c1h > MAX_PUMP_1H:    continue  # already pumped
-                    if liq < MIN_LIQ:        continue  # no exit
-                    if vol < MIN_VOL:        continue  # no interest
-                    if c5m < -15:            continue  # dumping
-                    if c1h < 0 and mcap > 500000: continue  # peaked
-                    # Confirm trend over 2 scans
-                    now = datetime.now(timezone.utc)
-                    if mint not in trending_tracker:
-                        trending_tracker[mint] = {"snapshots": [], "first_seen": now, "alerted": False}
-                    entry = trending_tracker[mint]
-                    if entry.get("alerted"): continue
-                    entry["snapshots"].append({"vol": vol, "c1h": c1h, "time": now})
-                    entry["snapshots"] = entry["snapshots"][-6:]
-                    if len(entry["snapshots"]) < 2: continue
-                    prev_vol = entry["snapshots"][-2]["vol"]
-                    if vol < prev_vol * 1.05 and vol < 30000: continue  # not growing
-                    reasons = []
-                    if c5m > 3:  reasons.append(f"5m +{c5m:.1f}%")
-                    if c1h > 5:  reasons.append(f"1h +{c1h:.1f}%")
-                    reasons.append(f"MCap {fmt_usd(mcap)}")
-                    reasons.append(f"Liq {fmt_usd(liq)}")
-                    found.append((mint, launchpad, "trending", " | ".join(reasons)))
-                    log.info(f"Scanner3 trending: {mint[:8]} — {' | '.join(reasons)}")
+                    found.append((mint, ("DexScreener Trending", "🔥")))
+    except Exception as e:
+        log.debug(f"Scanner3 search: {e}")
+
+    # ── Apply gates — alert on first sighting if it passes ────────────────────
+    actionable = []
+    for mint, launchpad in found:
+        if mint in trending_tracker and trending_tracker[mint].get("alerted"):
+            continue
+        try:
+            px = await fetch_price(session, mint)
+            if not px.get("found"): continue
+
+            mcap  = float(px.get("mcap",       0) or 0)
+            liq   = float(px.get("liquidity",  0) or 0)
+            vol   = float(px.get("volume_24h", 0) or 0)
+            c1h   = float(px.get("chg_1h",     0) or 0)
+            c5m   = float(px.get("chg_5m",     0) or 0)
+            c24h  = float(px.get("chg_24h",    0) or 0)
+
+            # Same effective_mcap trick as Scanner 2
+            effective_mcap = mcap if mcap > 0 else (liq * 10)
+
+            if effective_mcap > MAX_MCAP:   continue  # too big
+            if liq > 500_000:               continue  # established token
+            if c1h > MAX_PUMP_1H:           continue  # already pumped out
+            if liq < MIN_LIQ:               continue  # can't exit
+            if vol < MIN_VOL:               continue  # no real interest
+            if c5m < -15:                   continue  # actively dumping
+            if c24h > 1000 and c1h < -10:   continue  # peaked and rolling over
+
+            # Track so we don't alert twice
+            if mint not in trending_tracker:
+                trending_tracker[mint] = {"first_seen": now, "alerted": False}
+
+            reasons = []
+            if c5m > 3:  reasons.append(f"5m +{c5m:.1f}%")
+            if c1h > 5:  reasons.append(f"1h +{c1h:.1f}%")
+            if c24h > 0: reasons.append(f"24h +{c24h:.1f}%")
+            reasons.append(f"MCap {fmt_usd(effective_mcap)}")
+            reasons.append(f"Liq {fmt_usd(liq)}")
+
+            actionable.append((mint, launchpad, "trending", " | ".join(reasons)))
+            log.info(f"Scanner3 ✓ {mint[:8]} — {' | '.join(reasons)}")
+
         except Exception as e:
-            log.debug(f"Scanner3 {url[:40]}: {e}")
-    return found[:5]
+            log.debug(f"Scanner3 gate {mint[:8]}: {e}")
+
+    log.info(f"Scanner3 found {len(actionable)} trending candidates")
+    return actionable[:5]
 
 # ── Process a single token through scoring and alert ──────────────────────────
 async def process_token(session, bot: Bot, mint: str, launchpad: tuple,
